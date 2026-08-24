@@ -1,8 +1,18 @@
+> **CodexLink：Android 远程控制 Codex（Windows + Tailscale）**
+>
+> 本仓库是在 [Remodex](https://github.com/Emanuele-web04/remodex) 基础上整理的个人自用实现：
+> Android 端通过 Tailnet WSS 连接 Windows Companion，再由 Companion 通过 stdio
+> 驱动 Codex `app-server`。完整的安装、配对、Provider 和防火墙说明请先阅读
+> [`CODEXLINK.md`](CODEXLINK.md)。
+>
+> 已构建的 APK 和 Windows 安装包不提交到 Git 历史，而是作为 GitHub Release
+> 附件发布；源码安装和构建方式见 [`CODEXLINK.md`](CODEXLINK.md)。
+
 <p align="center">
   <img src="CodexMobile/CodexMobile/Assets.xcassets/remodex-og1.imageset/remodex-og2%20%281%29.png" alt="Remodex" />
 </p>
 
-# Remodex
+# Remodex / CodexLink upstream base
 
 [![npm version](https://img.shields.io/npm/v/remodex)](https://www.npmjs.com/package/remodex)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)

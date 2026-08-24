@@ -1,0 +1,37 @@
+{
+  "name": "remodex-v2-fixed-vector-1",
+  "fields": {
+    "sessionId": "session-vector-001",
+    "protocolVersion": 2,
+    "handshakeMode": "qr_bootstrap",
+    "keyEpoch": 7,
+    "macDeviceId": "mac-vector-001",
+    "phoneDeviceId": "phone-vector-001",
+    "macIdentityPublicKey": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+    "phoneIdentityPublicKey": "ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A=",
+    "macEphemeralPublicKey": "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2A=",
+    "phoneEphemeralPublicKey": "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1+f4A=",
+    "clientNonce": "gYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6A=",
+    "serverNonce": "oaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2+v8A=",
+    "expiresAtForTranscript": 1900000000000
+  },
+  "sharedSecret": "wcLDxMXGx8jJysvMzc7P0NHS09TV1tfY2drb3N3e3+A=",
+  "transcript": "AAAAD3JlbW9kZXgtZTJlZS12MQAAABJzZXNzaW9uLXZlY3Rvci0wMDEAAAABMgAAAAxxcl9ib290c3RyYXAAAAABNwAAAA5tYWMtdmVjdG9yLTAwMQAAABBwaG9uZS12ZWN0b3ItMDAxAAAAIAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gAAAAICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AAAAAIEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl9gAAAAIGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AAAAAIIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp+gAAAAIKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr/AAAAADTE5MDAwMDAwMDAwMDA=",
+  "salt": "N2ckrDXbxuOpwQ17h36Y//8gzNTc4k/a0Z3qFqu6H60=",
+  "phoneToMacKey": "FH00yqFfb/DbmdJuxlctGBRU5yP2IQ6f+VrYNnFd/uw=",
+  "macToPhoneKey": "oyK2WA54w9S7iLxlTp/iarNVwTpnTMMhBaqsx1EeQFA=",
+  "nonces": {
+    "mac5": "AQAAAAAAAAAAAAAF",
+    "iphone5": "AgAAAAAAAAAAAAAF"
+  },
+  "envelope": {
+    "kind": "encryptedEnvelope",
+    "v": 2,
+    "sessionId": "session-vector-001",
+    "keyEpoch": 7,
+    "sender": "mac",
+    "counter": 5,
+    "ciphertext": "iFJPWZfhrLiuBpAqhLgtytx+IKPTjrUs/9cuAIcQc9jpsjLN1hn6AQLjE2GfsiNyoNI1LHgv1X8Ud7gHWDA9TqFluPZSB393egdbcg==",
+    "tag": "qZW7eXS4U5WwtbDIELeyfA=="
+  }
+}

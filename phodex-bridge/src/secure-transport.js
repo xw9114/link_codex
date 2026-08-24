@@ -966,6 +966,10 @@ module.exports = {
   HANDSHAKE_MODE_TRUSTED_RECONNECT,
   PAIRING_QR_VERSION,
   SECURE_PROTOCOL_VERSION,
+  buildTranscriptBytes,
   createBridgeSecureTransport,
+  decryptEnvelopeBuffer,
+  deriveAesKey,
+  encryptEnvelopePayload,
   nonceForDirection,
 };

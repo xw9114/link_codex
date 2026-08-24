@@ -589,13 +589,30 @@ function readMacRegistrationHeaders(headers, sessionId) {
   return normalizeMacRegistration({
     macDeviceId: readHeaderString(headers["x-mac-device-id"]),
     macIdentityPublicKey: readHeaderString(headers["x-mac-identity-public-key"]),
-    displayName: readHeaderString(headers["x-machine-name"]),
+    displayName: decodeBase64UrlHeader(headers["x-machine-name-b64"])
+      || readHeaderString(headers["x-machine-name"]),
     trustedPhoneDeviceId: readHeaderString(headers["x-trusted-phone-device-id"]),
     trustedPhonePublicKey: readHeaderString(headers["x-trusted-phone-public-key"]),
     pairingCode: readHeaderString(headers["x-pairing-code"]),
     pairingVersion: readHeaderString(headers["x-pairing-version"]),
     pairingExpiresAt: readHeaderString(headers["x-pairing-expires-at"]),
   }, sessionId);
+}
+
+function decodeBase64UrlHeader(value) {
+  const encoded = readHeaderString(value);
+  if (!encoded || !/^[A-Za-z0-9_-]+$/.test(encoded) || encoded.length > 512) {
+    return "";
+  }
+  try {
+    const decoded = Buffer.from(encoded, "base64url").toString("utf8").trim();
+    if (!decoded || decoded.includes("\u0000") || Buffer.byteLength(decoded, "utf8") > 256) {
+      return "";
+    }
+    return decoded;
+  } catch {
+    return "";
+  }
 }
 
 function normalizeMacRegistration(registration, sessionId) {
@@ -728,6 +745,7 @@ function safeParseJSON(value) {
 }
 
 module.exports = {
+  decodeBase64UrlHeader,
   setupRelay,
   getRelayStats,
   hasActiveMacSession,

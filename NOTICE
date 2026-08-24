@@ -1,0 +1,23 @@
+CodexLink NOTICE
+===============
+
+CodexLink is a personal-use fork and integration built from Remodex.
+
+Remodex
+-------
+Copyright (c) Emanuele Di Pietro and Remodex contributors.
+
+CodexLink carries the Remodex v2 bridge, secure transport, relay, reconnect,
+and protocol-test portions from upstream commit:
+
+    8105e25038ad07443da01cda6c21e5f77ec61cd5
+
+Those portions are licensed under the Apache License, Version 2.0. A copy of
+the license is available in the repository root as LICENSE.
+
+CodexLink additions
+-------------------
+The CodexLink Android client, Windows Companion, provider store, Tailnet-only
+relay integration, protocol vectors, tests, and deployment scripts are
+provided for personal use under the repository's applicable open-source
+license terms. See THIRD_PARTY_NOTICES.md for dependency notices.

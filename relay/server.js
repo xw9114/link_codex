@@ -5,6 +5,7 @@
 // Depends on: http, ws, ./relay, ./push-service
 
 const http = require("http");
+const https = require("https");
 const { monitorEventLoopDelay } = require("perf_hooks");
 const { WebSocketServer } = require("ws");
 const {
@@ -24,6 +25,7 @@ function createRelayServer({
   upgradeRateLimiter = createFixedWindowRateLimiter({ windowMs: 60_000, maxRequests: 60 }),
   pushSessionService,
   relayOptions = {},
+  tlsOptions = null,
   trustProxy = false,
 } = {}) {
   const runtimeMetrics = createRuntimeMetrics();
@@ -41,7 +43,7 @@ function createRelayServer({
     }))
     : createDisabledPushSessionService();
 
-  const server = http.createServer((req, res) => {
+  const requestHandler = (req, res) => {
     void handleHTTPRequest(req, res, {
       exposeDetailedHealth,
       httpRateLimiter,
@@ -51,7 +53,10 @@ function createRelayServer({
       runtimeMetrics,
       trustProxy,
     });
-  });
+  };
+  const server = tlsOptions
+    ? https.createServer(tlsOptions, requestHandler)
+    : http.createServer(requestHandler);
   const wss = new WebSocketServer({
     noServer: true,
     perMessageDeflate: true,

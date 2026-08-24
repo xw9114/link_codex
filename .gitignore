@@ -32,6 +32,13 @@ security_best_practices_report.md
 *~
 output/
 
+# CodexLink build and local runtime output
+android/.gradle/
+android/**/build/
+companion/dist/
+dist/
+.scratch/
+
 # Minified JS bundles (not part of this project)
 /main-*.js
 /main.js

@@ -6,7 +6,7 @@
 
 const WebSocket = require("ws");
 const { constants: bufferConstants } = require("buffer");
-const { createHash, randomBytes } = require("crypto");
+const { createHash, randomBytes, X509Certificate, timingSafeEqual } = require("crypto");
 const { execFile, spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
@@ -43,6 +43,34 @@ const {
 } = require("./account-status");
 const { createBridgePackageVersionStatusReader } = require("./package-version-status");
 const { createPushNotificationServiceClient } = require("./push-notification-service-client");
+
+function writeRelayDiagnostic(message) {
+  const stateDir = process.env.REMODEX_DEVICE_STATE_DIR;
+  if (!stateDir) return;
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.appendFileSync(
+      path.join(stateDir, "relay-debug.log"),
+      `${new Date().toISOString()} ${String(message || "").slice(0, 500)}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+  } catch {
+    // Diagnostics must never affect the bridge.
+  }
+}
+
+function relayPeerMatchesPinnedCertificate(socket, certPem) {
+  if (!certPem) return true;
+  try {
+    const peer = socket?._socket?.getPeerCertificate?.();
+    if (!peer?.raw) return false;
+    const expected = new X509Certificate(certPem).raw;
+    return expected.length === peer.raw.length
+      && timingSafeEqual(expected, peer.raw);
+  } catch {
+    return false;
+  }
+}
 const { createPushNotificationTracker } = require("./push-notification-tracker");
 const { resolveCodexGeneratedImagesRoot } = require("./codex-home");
 const {
@@ -705,6 +733,7 @@ function startBridge({
   printPairingQr = true,
   onPairingSession = null,
   onBridgeStatus = null,
+  companionPolicy = null,
 } = {}) {
   const config = explicitConfig || readBridgeConfig();
   config.keepMacAwakeEnabled = config.keepMacAwakeEnabled === true;
@@ -733,7 +762,8 @@ function startBridge({
     iosAppVersion: deviceState.lastSeenPhoneAppVersion,
   });
   logIOSAppCompatibilityWarning(cachedIOSAppCompatibilityWarning);
-  const sessionId = relaySession.sessionId;
+  const sessionId = resolveConfiguredRelaySessionId(config.relaySessionId)
+    || relaySession.sessionId;
   const relaySessionUrl = `${relayBaseUrl}/${sessionId}`;
   const notificationSecret = randomBytes(24).toString("hex");
   const desktopRefresher = new CodexDesktopRefresher({
@@ -770,6 +800,8 @@ function startBridge({
   let reconnectAttempt = 0;
   let reconnectTimer = null;
   let relayWatchdogTimer = null;
+  let pairingRefreshTimer = null;
+  let pairingSession = null;
   let lastRelayActivityAt = 0;
   let lastConnectionStatus = null;
   let codexLaunchState = config.codexEndpoint ? "connected" : "starting";
@@ -888,8 +920,11 @@ function startBridge({
 
   const codex = createCodexTransport({
     endpoint: config.codexEndpoint,
-    env: process.env,
+    env: config.codexEnv || process.env,
     appPath: config.codexAppPath,
+    profile: config.codexProfile || "",
+    command: config.codexCommand || "",
+    configOverrides: config.codexConfigOverrides || [],
     logPrefix: "[remodex]",
   });
   const voiceHandler = createVoiceHandler({
@@ -968,6 +1003,8 @@ function startBridge({
     bridgeWakeAssertion.stop();
     clearReconnectTimer();
     clearRelayWatchdog();
+    clearTimeout(pairingRefreshTimer);
+    pairingRefreshTimer = null;
     bridgeStatusPublisher.stopHeartbeat();
     stopContextUsageWatcher();
     rolloutLiveMirror?.stopAll();
@@ -989,6 +1026,30 @@ function startBridge({
       socket.close();
     }
     codex.shutdown();
+  }
+
+  function restartCodex({
+    env = config.codexEnv || process.env,
+    configOverrides = config.codexConfigOverrides || [],
+  } = {}) {
+    if (isShuttingDown || typeof codex.restart !== "function") {
+      return false;
+    }
+    config.codexEnv = env;
+    config.codexConfigOverrides = configOverrides;
+    codexHandshakeState = "cold";
+    forwardedInitializeRequestIds.clear();
+    failBridgeManagedCodexRequests(new Error("Codex runtime restarted before the request completed."));
+    codex.restart({
+      env,
+      profile: config.codexProfile || "",
+      configOverrides,
+    });
+    sendApplicationResponse(JSON.stringify({
+      method: "codexlink/connection/reinitialize",
+      params: { reason: "provider_configuration_changed" },
+    }));
+    return true;
   }
 
   function startRelayWatchdog(trackedSocket) {
@@ -1074,6 +1135,17 @@ function startBridge({
 
     logConnectionStatus("connecting");
     const nextSocket = new WebSocket(relaySessionUrl, {
+      ...(config.relayTlsCa ? {
+        ca: config.relayTlsCa,
+        // Electron's embedded TLS stack rejects the self-signed leaf when it
+        // is supplied as a CA (the leaf intentionally has cA=false). The
+        // relay is local/Tailnet-only, so bypass chain validation here and
+        // enforce the exact pinned leaf after the handshake below.
+        rejectUnauthorized: false,
+        // The Companion pins its private self-signed leaf as the only CA.
+        // TailIP/MagicDNS changes therefore do not need public-PKI hostname validation.
+        checkServerIdentity: () => undefined,
+      } : {}),
       perMessageDeflate: {
         zlibDeflateOptions: { level: 6 },
         threshold: 256,
@@ -1089,6 +1161,13 @@ function startBridge({
     socket = nextSocket;
 
     nextSocket.on("open", () => {
+      if (!relayPeerMatchesPinnedCertificate(nextSocket, config.relayTlsCa)) {
+        const detail = "relay certificate pin mismatch";
+        console.warn(`[remodex] ${detail}`);
+        writeRelayDiagnostic(detail);
+        nextSocket.terminate();
+        return;
+      }
       markRelayActivity();
       clearReconnectTimer();
       reconnectAttempt = 0;
@@ -1123,11 +1202,16 @@ function startBridge({
       markRelayActivity();
     });
 
-    nextSocket.on("close", (code) => {
+    nextSocket.on("close", (code, reason) => {
       if (socket === nextSocket) {
         clearRelayWatchdog();
       }
       logConnectionStatus("disconnected");
+      if (code !== 1000 && code !== 1001) {
+        const detail = `relay closed (${code}): ${reason?.toString?.() || ""}`;
+        console.warn(`[remodex] ${detail}`);
+        writeRelayDiagnostic(detail);
+      }
       if (socket === nextSocket) {
         socket = null;
       }
@@ -1137,32 +1221,49 @@ function startBridge({
       scheduleRelayReconnect(code);
     });
 
-    nextSocket.on("error", () => {
+    nextSocket.on("error", (error) => {
       if (socket === nextSocket) {
         clearRelayWatchdog();
       }
       logConnectionStatus("disconnected");
+      const detail = `relay socket error: ${error?.message || "unknown error"}`;
+      console.warn(`[remodex] ${detail}`);
+      writeRelayDiagnostic(detail);
     });
   }
 
-  const pairingPayload = secureTransport.createPairingPayload();
-  const pairingSession = {
-    pairingPayload,
-    pairingCode: createShortPairingCode({ length: SHORT_PAIRING_CODE_LENGTH }),
-  };
-  onPairingSession?.(pairingSession);
-  if (printPairingQr) {
-    printQR(pairingSession);
+  function refreshPairingSession() {
+    pairingSession = {
+      pairingPayload: secureTransport.createPairingPayload(),
+      pairingCode: createShortPairingCode({ length: SHORT_PAIRING_CODE_LENGTH }),
+    };
+    onPairingSession?.(pairingSession);
+    if (printPairingQr) printQR(pairingSession);
+    sendRelayRegistrationUpdate(deviceState);
+    clearTimeout(pairingRefreshTimer);
+    pairingRefreshTimer = setTimeout(refreshPairingSession, 5 * 60 * 1000);
+    pairingRefreshTimer.unref?.();
   }
+  refreshPairingSession();
   pushServiceClient.logUnavailable();
   connectRelay();
 
   codex.onMessage((message) => {
     // Streaming deltas make this the hottest path in the bridge: parse the
     // envelope once and share the read-only object with every observer.
-    const parsedMessage = parseBridgeMessage(message);
+    let parsedMessage = parseBridgeMessage(message);
     if (handleBridgeManagedCodexResponse(message, parsedMessage)) {
       return;
+    }
+    if (companionPolicy) {
+      const filteredMessage = companionPolicy.filterOutbound(message, parsedMessage);
+      if (filteredMessage == null) {
+        return;
+      }
+      if (filteredMessage !== message) {
+        message = filteredMessage;
+        parsedMessage = parseBridgeMessage(message);
+      }
     }
     updatePendingAuthLoginFromCodexMessage(message, parsedMessage);
     trackCodexHandshakeState(message, parsedMessage);
@@ -1213,6 +1314,12 @@ function startBridge({
       return;
     }
     if (handleBridgeManagedAccountRequest(rawMessage, sendApplicationResponse, parsedMessage)) {
+      return;
+    }
+    if (companionPolicy?.handleInbound(rawMessage, {
+      sendResponse: sendApplicationResponse,
+      forward: forwardInboundRequestToCodex,
+    })) {
       return;
     }
     if (voiceHandler.handleVoiceRequest(rawMessage, sendApplicationResponse, parsedMessage)) {
@@ -2221,6 +2328,7 @@ function startBridge({
   }
 
   return {
+    restartCodex,
     stop: stopBridge,
   };
 }
@@ -2318,10 +2426,14 @@ function createMacOSBridgeWakeAssertion({
 // Registers the canonical Mac identity and the one trusted phone allowed for auto-resolve.
 function buildMacRegistrationHeaders(deviceState, pairingSession) {
   const registration = buildMacRegistration(deviceState, pairingSession);
+  const machineName = encodeHeaderDisplayName(registration.displayName);
   const headers = {
     "x-mac-device-id": registration.macDeviceId,
     "x-mac-identity-public-key": registration.macIdentityPublicKey,
-    "x-machine-name": registration.displayName,
+    // Node rejects non-Latin-1 header values. Keep the legacy header usable
+    // while carrying the exact UTF-8 value in an explicit Base64URL header.
+    "x-machine-name": machineName.asciiFallback,
+    "x-machine-name-b64": machineName.base64Url,
     "x-pairing-code": registration.pairingCode,
     "x-pairing-version": registration.pairingVersion ? String(registration.pairingVersion) : "",
     "x-pairing-expires-at": registration.pairingExpiresAt ? String(registration.pairingExpiresAt) : "",
@@ -2331,6 +2443,22 @@ function buildMacRegistrationHeaders(deviceState, pairingSession) {
     headers["x-trusted-phone-public-key"] = registration.trustedPhonePublicKey;
   }
   return headers;
+}
+
+function encodeHeaderDisplayName(value) {
+  const displayName = normalizeNonEmptyString(value) || "CodexLink host";
+  const asciiFallback = /^[\x20-\x7e]+$/.test(displayName)
+    ? displayName
+    : "CodexLink host";
+  return {
+    asciiFallback,
+    base64Url: Buffer.from(displayName, "utf8").toString("base64url"),
+  };
+}
+
+function resolveConfiguredRelaySessionId(value) {
+  const sessionId = normalizeNonEmptyString(value);
+  return /^[A-Za-z0-9._~-]{16,128}$/.test(sessionId) ? sessionId : "";
 }
 
 function buildMacRegistration(deviceState, pairingSession) {
@@ -5050,6 +5178,7 @@ function shouldSuppressRolloutMirrorForThread(
 
 module.exports = {
   annotateTurnStateProbeWithMirrorActiveTurn,
+  buildMacRegistrationHeaders,
   buildThreadTurnsListRelaySanitizeContext,
   buildHeartbeatBridgeStatus,
   canonicalThreadTurnsListRequest,
@@ -5063,6 +5192,7 @@ module.exports = {
   normalizeTurnStartForCodex,
   normalizeRelayBoundJsonRpcMessage,
   persistBridgePreferences,
+  resolveConfiguredRelaySessionId,
   resolveJsonlTurnsListRolloutPathForFallback,
   sanitizeLiveGeneratedImageMessageForRelay,
   sanitizeLiveUserNotification,

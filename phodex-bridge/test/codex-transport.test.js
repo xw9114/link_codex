@@ -95,6 +95,23 @@ test("spawn launch plans add the bundled Codex app binary as a fallback on macOS
   }
 });
 
+test("resolved native Codex launches app-server with non-secret config overrides", () => {
+  const executable = "C:\\Codex\\codex.exe";
+  const launches = createCodexLaunchPlans({
+    env: {},
+    command: executable,
+    configOverrides: ["model_providers.codexlink_test.wire_api=\"responses\""],
+    platform: "win32",
+    fsImpl: { statSync: (candidate) => ({ isFile: () => candidate === executable }) },
+  });
+  assert.equal(launches[0].command, executable);
+  assert.deepEqual(launches[0].args, [
+    "app-server",
+    "-c",
+    "model_providers.codexlink_test.wire_api=\"responses\"",
+  ]);
+});
+
 test("spawn launch plans keep the default codex command first even when a bundled fallback exists", () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "remodex-codex-path-"));
   const appPath = path.join(tempDir, "Codex.app");

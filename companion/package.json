@@ -1,0 +1,87 @@
+{
+  "name": "codexlink-companion",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tailnet-only Windows companion for CodexLink",
+  "author": "CodexLink contributors",
+  "main": "src/main/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "test": "node --test test/*.test.js",
+    "dist": "electron-builder --win nsis"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "selfsigned": "^3.0.1",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "electron": "^39.2.7",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "dev.local.codexlink.companion",
+    "productName": "CodexLink Companion",
+    "electronDist": "node_modules/electron/dist",
+    "asar": true,
+    "files": [
+      "src/**/*",
+      "scripts/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../phodex-bridge",
+        "to": "phodex-bridge",
+        "filter": [
+          "src/**/*",
+          "package.json",
+          "node_modules/**/*"
+        ]
+      },
+      {
+        "from": "../relay",
+        "to": "relay",
+        "filter": [
+          "*.js",
+          "package.json",
+          "node_modules/**/*"
+        ]
+      },
+      {
+        "from": "scripts",
+        "to": "codexlink-scripts",
+        "filter": [
+          "*.ps1"
+        ]
+      },
+      {
+        "from": "node_modules/ws",
+        "to": "node_modules/ws",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "node_modules/qrcode-terminal",
+        "to": "node_modules/qrcode-terminal",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "artifactName": "CodexLink-Companion-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "runAfterFinish": true
+    }
+  }
+}

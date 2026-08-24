@@ -1,0 +1,142 @@
+# CodexLink
+
+CodexLink is a personal, one-phone/one-Windows-PC remote controller for Codex.
+The data path is deliberately private:
+
+```text
+Android 10+ -> Tailscale Tailnet WSS -> CodexLink Companion
+            -> codex app-server (stdio JSONL) -> allowlisted local project
+```
+
+There is no public relay in the personal deployment. The Companion binds only
+to a Tailscale CGNAT/ULA address and uses a persistent self-signed certificate
+that the Android client pins during pairing. The WebSocket payload is then
+protected by the Remodex v2 E2EE session (Ed25519 identity, X25519 ephemeral
+keys, HKDF-SHA256, AES-256-GCM and replay sequencing).
+
+## Included deliverables
+
+- `companion/`: Electron tray Companion, provider management, project
+  allowlist, Windows Credential Manager integration and private TLS relay.
+  The packaged installer includes the Relay/Bridge `ws` runtime dependency;
+  no separate Node.js or npm installation is required on the target PC.
+- `android/`: Kotlin/Compose client (`minSdk 29`) with QR pairing, foreground
+  reconnect service, encrypted Room cache and task/approval UI.
+- `protocol/`: shared secure-transport test vectors.
+- `phodex-bridge/` and `relay/`: Remodex bridge/relay integration used by the
+  Companion.
+- `companion/scripts/install-tailnet-firewall.ps1` and
+  `companion/scripts/remove-tailnet-firewall.ps1`: administrator-only Windows
+  firewall rules for the private listener.
+
+## Requirements
+
+Windows 10/11, Tailscale in the `Running` state, Codex CLI `0.148.0` or newer,
+and an Android 10+ phone on the same Tailnet. The Companion keeps the existing
+`CODEX_HOME`, so desktop Codex threads remain visible. The computer must stay
+awake, online and logged in while a task is running.
+
+## Build
+
+### Android debug APK
+
+```powershell
+$env:ANDROID_HOME = 'E:\android-sdk'
+$env:ANDROID_SDK_ROOT = $env:ANDROID_HOME
+cd E:\codex\codexlink\android
+E:\android-sdk\gradle-8.11.1\bin\gradle.bat `
+  testDebugUnitTest assembleDebug assembleDebugAndroidTest
+```
+
+The debug APK is emitted at
+`android/app/build/outputs/apk/debug/app-debug.apk`. It is signed with the
+local Android debug key, not a release/store key; install it only on a device
+where you trust the APK.
+
+### Windows NSIS package
+
+```powershell
+cd E:\codex\codexlink\companion
+$env:ELECTRON_BUILDER_BINARIES_MIRROR =
+  'https://npmmirror.com/mirrors/electron-builder-binaries/'
+npm ci
+npm run dist
+```
+
+The installer is `companion/dist/CodexLink-Companion-0.1.0-x64.exe`.
+
+For the current local build, copies are also in `dist/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `dist/CodexLink-Companion-0.1.0-x64.exe` | `7915A3AC38BC250A4397788277DC26ABBA59004149DFCD2DC7A3E30484F31278` |
+| `dist/CodexLink-Android-0.1.0-debug.apk` | `2C1B72BC2D8ED0D65B1DD645C04E86F89852A0651D367A0F34B4B03F506D3F06` |
+
+## Install and pair
+
+1. Install Tailscale on both devices and sign in to the same Tailnet.
+2. On Windows, install the NSIS package and allow CodexLink to start with
+   Windows. Confirm that `tailscale status --json` reports `BackendState:
+   Running` and that `codex --version` is at least `0.148.0`.
+3. From an elevated PowerShell prompt, run
+   `companion/scripts/install-tailnet-firewall.ps1` in the source checkout. If
+   using the installed Companion, the same scripts are available under its
+   `resources\codexlink-scripts` directory. The script removes stale CodexLink
+   rules and creates inbound TCP `9443` rules scoped to the current Tailnet
+   address, Tailnet CGNAT/ULA sources and the detected Tailscale interface.
+4. Open the Companion tray window, add each permitted project directory and
+   review the desktop permission ceiling. The default is `workspace-write` and
+   `on-request`; the phone cannot raise it.
+5. Scan the five-minute QR code in the Android app. The QR contains only the
+   private WSS endpoint, session bootstrap metadata, certificate fingerprints
+   and an expiring pairing code. A new scan is required after resetting trust.
+6. Start a task from an allowlisted `projectId`. API Provider credentials are
+   entered on the phone over E2EE and stored only in Windows Credential
+   Manager; they are not written to the Android database or logs.
+
+## Providers
+
+The Companion exposes `chatgpt`, `openai_responses` and `custom_responses`.
+Custom providers must implement the Responses API at `Base URL/responses`.
+Chat Completions conversion is intentionally unsupported. A provider is fixed
+when a thread starts; changing it requires a new or forked thread. Provider
+changes restart the idle app-server after the current task completes.
+
+## Security and operational boundaries
+
+- The phone submits a project ID, never a filesystem path. The Companion
+  resolves it against its canonical allowlist and rejects traversal, junction
+  aliases and sibling-prefix escapes.
+- The Companion never binds `0.0.0.0`, a LAN address or a public interface.
+- API keys and custom header values are passed to Codex through process
+  environment variables and Windows Credential Manager, and are redacted from
+  responses/logs.
+- `danger-full-access` and `never` approvals are desktop opt-ins. They are not
+  available from the phone unless the desktop ceiling explicitly allows them.
+- Remove the firewall rules before uninstalling if another service needs port
+  `9443`:
+
+```powershell
+.\remove-tailnet-firewall.ps1
+```
+
+Use the matching path under `resources\codexlink-scripts` when running from an
+installed Companion.
+
+## Verification
+
+From the repository root:
+
+```powershell
+cd E:\codex\codexlink\relay; npm test
+cd E:\codex\codexlink\companion; npm test
+cd E:\codex\codexlink\phodex-bridge; npm test
+```
+
+The Relay and Companion suites pass on Windows. The Bridge suite includes
+upstream macOS launchd and symlink tests; those are skipped or fail when run on
+Windows without Developer Mode. Its parallel rollout-mirror tests can also be
+timing-sensitive in the full multi-file run; the CodexLink compatibility tests
+and an isolated rollout-mirror run pass. The Android unit/instrumentation
+compilation command above has passed; a physical-device QR and
+foreground-service run is still required for final hardware acceptance.

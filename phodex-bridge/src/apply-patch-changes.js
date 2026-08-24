@@ -172,7 +172,9 @@ function normalizePatchPath(rawPath, cwd) {
     return filePath;
   }
 
-  return relativePath;
+  // Relay file-change paths are protocol values, not local filesystem paths.
+  // Keep them stable across Windows and POSIX hosts.
+  return relativePath.replace(/\\/g, "/");
 }
 
 function readString(value) {

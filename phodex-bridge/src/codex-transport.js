@@ -13,6 +13,9 @@ function createCodexTransport({
   endpoint = "",
   env = process.env,
   appPath = "",
+  profile = "",
+  command = "",
+  configOverrides = [],
   platform = process.platform,
   spawnImpl = spawn,
   WebSocketImpl = WebSocket,
@@ -21,17 +24,21 @@ function createCodexTransport({
     return createWebSocketTransport({ endpoint, WebSocketImpl });
   }
 
-  return createSpawnTransport({ env, appPath, platform, spawnImpl });
+  return createSpawnTransport({ env, appPath, profile, command, configOverrides, platform, spawnImpl });
 }
 
-function createSpawnTransport({ env, appPath, platform, spawnImpl = spawn }) {
-  const launchPlans = createCodexLaunchPlans({ env, appPath, platform });
+function createSpawnTransport({ env, appPath, profile, command, configOverrides, platform, spawnImpl = spawn }) {
+  let currentEnv = env;
+  let currentProfile = profile;
+  let currentConfigOverrides = configOverrides;
+  let launchPlans = createCodexLaunchPlans({ env: currentEnv, appPath, profile: currentProfile, command, configOverrides: currentConfigOverrides, platform });
   let launchIndex = -1;
   let activeLaunch = null;
   let codex = null;
   let stdoutBuffer = "";
   let stderrBuffer = "";
   let didRequestShutdown = false;
+  let didRequestRestart = false;
   let didReportError = false;
   const listeners = createListenerBag();
 
@@ -64,6 +71,35 @@ function createSpawnTransport({ env, appPath, platform, spawnImpl = spawn }) {
     shutdown() {
       didRequestShutdown = true;
       shutdownCodexProcess(codex);
+    },
+    restart({
+      env: nextEnv = currentEnv,
+      profile: nextProfile = currentProfile,
+      configOverrides: nextConfigOverrides = currentConfigOverrides,
+    } = {}) {
+      if (didRequestShutdown) {
+        throw new Error("Cannot restart a Codex transport after shutdown.");
+      }
+      currentEnv = nextEnv;
+      currentProfile = nextProfile;
+      currentConfigOverrides = nextConfigOverrides;
+      launchPlans = createCodexLaunchPlans({
+        env: currentEnv,
+        appPath,
+        profile: currentProfile,
+        command,
+        configOverrides: currentConfigOverrides,
+        platform,
+      });
+      launchIndex = -1;
+      didReportError = false;
+      didRequestRestart = true;
+      if (!codex || codex.killed || codex.exitCode !== null) {
+        didRequestRestart = false;
+        spawnNextLaunch();
+      } else {
+        shutdownCodexProcess(codex);
+      }
     },
   };
 
@@ -108,6 +144,12 @@ function createSpawnTransport({ env, appPath, platform, spawnImpl = spawn }) {
     });
     child.on("close", (code, signal) => {
       if (child !== codex) {
+        return;
+      }
+
+      if (didRequestRestart && !didRequestShutdown) {
+        didRequestRestart = false;
+        spawnNextLaunch();
         return;
       }
 
@@ -172,41 +214,68 @@ function createSpawnTransport({ env, appPath, platform, spawnImpl = spawn }) {
 function createCodexLaunchPlans({
   env,
   appPath = "",
+  profile = "",
+  command = "",
+  configOverrides = [],
   platform = process.platform,
   fsImpl = fs,
   pathImpl = path,
 } = {}) {
+  const normalizedProfile = typeof profile === "string" ? profile.trim() : "";
+  if (normalizedProfile && !/^[A-Za-z0-9_-]+$/.test(normalizedProfile)) {
+    throw new Error("Codex profile names may contain only letters, numbers, underscores, and hyphens.");
+  }
+  const profileArgs = normalizedProfile ? ["--profile", normalizedProfile] : [];
+  const normalizedOverrides = Array.isArray(configOverrides)
+    ? configOverrides.map((value) => String(value)).filter(Boolean)
+    : [];
+  const appServerArgs = ["app-server", ...normalizedOverrides.flatMap((value) => ["-c", value])];
   const sharedOptions = {
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...env },
   };
 
+  if (command) {
+    if (!isLaunchableFile(command, { fsImpl })) {
+      throw new Error(`Configured Codex executable does not exist: ${command}`);
+    }
+    return [{
+      command,
+      args: appServerArgs,
+      options: { ...sharedOptions, windowsHide: platform === "win32" },
+      description: `\`${command} app-server\``,
+    }];
+  }
+
   if (platform === "win32") {
+    if (normalizedOverrides.length > 0) {
+      throw new Error("Codex config overrides on Windows require a resolved native Codex executable.");
+    }
     return [{
       command: env.ComSpec || "cmd.exe",
-      args: ["/d", "/c", "codex app-server"],
+      args: ["/d", "/c", `codex ${normalizedProfile ? `--profile ${normalizedProfile} ` : ""}app-server`],
       options: {
         ...sharedOptions,
         windowsHide: true,
       },
-      description: "`cmd.exe /d /c codex app-server`",
+      description: `\`cmd.exe /d /c codex ${normalizedProfile ? `--profile ${normalizedProfile} ` : ""}app-server\``,
     }];
   }
 
   const launches = [{
     command: "codex",
-    args: ["app-server"],
+    args: [...profileArgs, ...appServerArgs],
     options: sharedOptions,
-    description: "`codex app-server`",
+    description: `\`codex ${normalizedProfile ? `--profile ${normalizedProfile} ` : ""}app-server\``,
   }];
 
   const bundledCommand = buildBundledCodexPath(appPath, { fsImpl, pathImpl });
   if (bundledCommand) {
     launches.push({
       command: bundledCommand,
-      args: ["app-server"],
+      args: [...profileArgs, ...appServerArgs],
       options: sharedOptions,
-      description: `\`${bundledCommand} app-server\``,
+      description: `\`${bundledCommand} ${normalizedProfile ? `--profile ${normalizedProfile} ` : ""}app-server\``,
     });
   }
 

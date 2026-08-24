@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'">
+  <title>CodexLink Companion</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">C</span><div><strong>CodexLink</strong><small>Windows Companion</small></div></div>
+      <nav>
+        <button class="nav-item active" data-page="overview">概览</button>
+        <button class="nav-item" data-page="projects">项目白名单</button>
+        <button class="nav-item" data-page="providers">API Provider</button>
+        <button class="nav-item" data-page="logs">运行日志</button>
+      </nav>
+      <div class="sidebar-foot"><span id="side-status-dot" class="dot"></span><span id="side-status">正在启动</span></div>
+    </aside>
+    <main>
+      <header><div><p class="eyebrow">TAILNET CONTROL PLANE</p><h1 id="page-title">连接概览</h1></div><button id="refresh" class="button secondary">刷新状态</button></header>
+
+      <section id="page-overview" class="page active">
+        <div class="status-grid">
+          <article class="metric"><span>Tailscale</span><strong id="tailscale-state">—</strong><small id="tailscale-address">等待检测</small></article>
+          <article class="metric"><span>Bridge</span><strong id="bridge-state">—</strong><small id="bridge-detail">等待启动</small></article>
+          <article class="metric"><span>Codex</span><strong id="codex-state">—</strong><small id="codex-version">等待检测</small></article>
+        </div>
+        <div class="overview-grid">
+          <article class="panel pairing-panel">
+            <div class="panel-head"><div><p class="eyebrow">一次性配对</p><h2>用 Android 扫码</h2></div><span class="badge">5 分钟有效</span></div>
+            <div class="qr-wrap"><img id="pairing-qr" alt="CodexLink 配对二维码"><div id="qr-empty">Bridge 启动后显示二维码</div></div>
+            <p class="muted center">二维码只包含 Tailnet WSS 地址、临时会话、主机公钥与 TLS 指纹。</p>
+            <button id="reset-pairing" class="text-button">重置可信手机并生成新二维码</button>
+          </article>
+          <article class="panel security-panel">
+            <p class="eyebrow">安全边界</p><h2>流量不离开 Tailnet</h2>
+            <ul class="checks">
+              <li><b>私网监听</b><span>拒绝 0.0.0.0 与公网地址</span></li>
+              <li><b>端到端加密</b><span>Ed25519 + X25519 + AES-256-GCM</span></li>
+              <li><b>路径隔离</b><span>手机只提交不透明 projectId</span></li>
+              <li><b>权限上限</b><span>默认 workspace-write + on-request</span></li>
+              <li><b>密钥存储</b><span>Windows Credential Manager</span></li>
+            </ul>
+            <div class="permission-box">
+              <label class="switch-row"><span><b>允许 danger-full-access</b><small>手机可为新任务选择完全访问</small></span><input id="allow-danger" type="checkbox"></label>
+              <label class="switch-row"><span><b>允许 never 审批</b><small>手机可为新任务关闭审批</small></span><input id="allow-never" type="checkbox"></label>
+              <button id="save-security" class="button secondary">保存电脑端权限上限</button>
+            </div>
+            <div id="restart-note" class="notice hidden">Provider 已更新，将在当前任务完成后重启 App Server。</div>
+          </article>
+        </div>
+      </section>
+
+      <section id="page-projects" class="page">
+        <div class="section-head"><div><p class="eyebrow">电脑端授权</p><h2>允许手机操作的项目</h2><p class="muted">手机端无法输入或浏览任意本地路径。</p></div><button id="add-project" class="button primary">添加项目</button></div>
+        <div id="project-list" class="list"></div>
+      </section>
+
+      <section id="page-providers" class="page">
+        <div class="section-head"><div><p class="eyebrow">RESPONSES API ONLY</p><h2>模型 Provider</h2><p class="muted">密钥只保存在此电脑，手机与日志不会再次看到明文。</p></div><button id="add-provider" class="button primary">新增 Provider</button></div>
+        <div id="provider-list" class="list"></div>
+      </section>
+
+      <section id="page-logs" class="page">
+        <div class="section-head"><div><p class="eyebrow">本地诊断</p><h2>运行日志</h2><p class="muted">会话令牌、API Key 与配对标识不会写入日志。</p></div></div>
+        <div id="log-list" class="log-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="provider-dialog">
+    <form id="provider-form" method="dialog">
+      <div class="dialog-head"><div><p class="eyebrow">Provider</p><h2>配置 Responses API</h2></div><button type="button" id="close-dialog" class="icon-button">×</button></div>
+      <input id="provider-id" type="hidden">
+      <label>类型<select id="provider-kind"><option value="openai_responses">OpenAI Responses</option><option value="custom_responses">自定义 Responses</option></select></label>
+      <label>显示名称<input id="provider-name" required maxlength="80" placeholder="例如：OpenAI API"></label>
+      <label>Base URL<input id="provider-url" required placeholder="https://api.openai.com/v1"></label>
+      <label>默认模型<input id="provider-model" required placeholder="gpt-5.6-terra"></label>
+      <label>API Key<input id="provider-key" type="password" autocomplete="new-password" placeholder="留空表示保留已保存的密钥"></label>
+      <label>可选请求头<textarea id="provider-headers" rows="4" placeholder="X-Tenant: tenant-a&#10;X-Region: cn"></textarea></label>
+      <p class="muted small">每行填写一个 Header: value。请求头值同样进入 Credential Manager，不写入 Provider 元数据。</p>
+      <div id="form-error" class="form-error"></div>
+      <div class="dialog-actions"><button type="button" id="cancel-dialog" class="button secondary">取消</button><button type="submit" class="button primary">保存</button></div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast"></div>
+  <script src="./renderer.js"></script>
+</body>
+</html>
