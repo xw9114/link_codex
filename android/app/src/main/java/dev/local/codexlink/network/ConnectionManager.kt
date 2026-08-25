@@ -55,8 +55,13 @@ class ConnectionManager @Inject constructor(
     private var socket: WebSocket? = null
     private var transport: SecureTransport? = null
     private var connectJob: Job? = null
+    private var reconnectJob: Job? = null
     private var stopped = true
     private var attempt = 0
+    // SecureTransport's outbound counter and OkHttp's send queue must advance
+    // together. initialize(), refreshAll() and notification responses can be
+    // launched from different coroutines immediately after a handshake.
+    private val sendLock = Any()
 
     fun start() {
         stopped = false
@@ -68,6 +73,8 @@ class ConnectionManager @Inject constructor(
         stopped = true
         connectJob?.cancel()
         connectJob = null
+        reconnectJob?.cancel()
+        reconnectJob = null
         socket?.close(1000, "CodexLink stopped")
         socket = null
         transport = null
@@ -75,8 +82,15 @@ class ConnectionManager @Inject constructor(
     }
 
     fun sendApplication(text: String) {
-        val activeTransport = transport ?: error("Companion is not connected")
-        check(socket?.send(activeTransport.encryptApplication(text)) == true) { "WebSocket send failed" }
+        synchronized(sendLock) {
+            val activeTransport = transport ?: error("Companion is not connected")
+            val activeSocket = socket ?: error("Companion is not connected")
+            // Encrypting and enqueueing as one critical section prevents two
+            // concurrent callers from producing duplicate/out-of-order counters.
+            check(activeSocket.send(activeTransport.encryptApplication(text))) {
+                "WebSocket send failed"
+            }
+        }
     }
 
     private suspend fun connectOnce() {
@@ -104,15 +118,19 @@ class ConnectionManager @Inject constructor(
 
     private fun scheduleReconnect(reason: String) {
         if (stopped) return
+        if (reconnectJob?.isActive == true) return
+        val oldSocket = socket
         socket = null
         transport = null
+        oldSocket?.close(4000, "Reconnect")
         val exponent = min((attempt - 1).coerceAtLeast(0), 6)
         val delayMs = min(60_000L, 1_000L shl exponent)
         mutableState.value = ConnectionState.Waiting(reason, delayMs)
         connectJob?.cancel()
-        connectJob = scope.launch {
+        reconnectJob = scope.launch {
             delay(delayMs + (0..750).random())
-            connectOnce()
+            reconnectJob = null
+            if (!stopped && socket == null) connectOnce()
         }
     }
 
@@ -133,6 +151,7 @@ class ConnectionManager @Inject constructor(
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
+            if (socket !== webSocket) return
             val active = transport ?: return
             active.handleWire(text).forEach { event ->
                 when (event) {
@@ -150,7 +169,9 @@ class ConnectionManager @Inject constructor(
                             scope.launch { hostDao.updateReplayCursor(host.macDeviceId, sequence, event.bridgeReplayEpoch) }
                         }
                     }
-                    is SecureEvent.Error -> scheduleReconnect("${event.code}: ${event.message}")
+                    is SecureEvent.Error -> {
+                        scheduleReconnect("${event.code}: ${event.message}")
+                    }
                 }
             }
         }
@@ -160,11 +181,11 @@ class ConnectionManager @Inject constructor(
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            if (!stopped) scheduleReconnect(reason.ifBlank { "连接已关闭" })
+            if (!stopped && socket === webSocket) scheduleReconnect(reason.ifBlank { "连接已关闭" })
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            if (!stopped) scheduleReconnect(t.message ?: "网络不可用")
+            if (!stopped && socket === webSocket) scheduleReconnect(t.message ?: "网络不可用")
         }
     }
 }

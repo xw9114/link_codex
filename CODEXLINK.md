@@ -70,7 +70,12 @@ For the current local build, copies are also in `dist/`:
 | Artifact | SHA-256 |
 | --- | --- |
 | `dist/CodexLink-Companion-0.1.0-x64.exe` | `7915A3AC38BC250A4397788277DC26ABBA59004149DFCD2DC7A3E30484F31278` |
-| `dist/CodexLink-Android-0.1.0-debug.apk` | `2C1B72BC2D8ED0D65B1DD645C04E86F89852A0651D367A0F34B4B03F506D3F06` |
+| `dist/CodexLink-Android-0.1.1-debug.apk` | `EC046142EA0E9BBA90A72D38F617832AAA3E819DA111510B63C813B8A2B900F9` |
+
+The Android 0.1.1 build serializes encrypted WebSocket sends and suppresses
+duplicate reconnect callbacks. This prevents the initial `initialize` and
+`project/list` requests from racing during handshake and leaving the phone in
+an online/reconnecting loop.
 
 ## Install and pair
 
