@@ -327,6 +327,7 @@ private fun ThreadScreen(state: MainUiState, threadId: String, viewModel: MainVi
     var steer by remember { mutableStateOf("") }
     var approval by remember { mutableStateOf<ApprovalEntity?>(null) }
     val timeline = state.timelines[threadId].orEmpty()
+    val conversation = timeline.filter(::isConversationEntry)
     Scaffold(
         containerColor = Paper,
         topBar = { TopAppBar(title = { Column { Text(thread?.name ?: "任务", maxLines = 1, overflow = TextOverflow.Ellipsis); Text(threadId.take(12), color = Muted, style = MaterialTheme.typography.labelSmall) } }, navigationIcon = { TextButton(onClick = { viewModel.openThread(null) }) { Text("‹ 返回") } }, actions = { TextButton(onClick = { viewModel.interrupt(threadId) }) { Text("停止") } }) },
@@ -334,12 +335,64 @@ private fun ThreadScreen(state: MainUiState, threadId: String, viewModel: MainVi
     ) { padding ->
         LazyColumn(Modifier.padding(padding).fillMaxSize().padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             state.approvals.filter { it.threadId == threadId }.forEach { pending -> item(key = "approval-${pending.requestId}") { Card(Modifier.fillMaxWidth().clickable { approval = pending }, colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3C9))) { Column(Modifier.padding(14.dp)) { Text("等待你的审批", fontWeight = FontWeight.Bold); Text(pending.method, color = Muted); Text("点按查看详情", color = Color(0xFF705B16)) } } } }
-            if (timeline.isEmpty()) item { EmptyCard("正在读取任务流；断线恢复后会按序补发事件。") }
-            items(timeline, key = { "${it.stableId}-${it.timestamp}" }) { entry -> Card(colors = CardDefaults.cardColors(containerColor = Panel), modifier = Modifier.fillMaxWidth()) { Column(Modifier.padding(13.dp)) { Text(entry.title, fontWeight = FontWeight.Bold); if (entry.body.isNotBlank()) Text(entry.body, modifier = Modifier.padding(top = 6.dp), fontFamily = if (entry.type.contains("command") || entry.type.contains("patch") || entry.type.contains("fileChange")) FontFamily.Monospace else FontFamily.Default); Text(entry.type, color = Muted, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 7.dp)) } } }
+            if (conversation.isEmpty()) item { EmptyCard("Codex 正在处理；完成后这里只显示对话结果。") }
+            items(conversation, key = { "${it.stableId}-${it.timestamp}" }) { entry -> ConversationBubble(entry) }
             item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { TextButton(onClick = { viewModel.fork(threadId) }) { Text("Fork") }; TextButton(onClick = { viewModel.archive(threadId) }) { Text("归档") } }; Spacer(Modifier.height(10.dp)) }
         }
     }
     approval?.let { pending -> ApprovalDialog(pending, onDismiss = { approval = null }) { decision -> viewModel.approve(pending.requestId, decision); approval = null } }
+}
+
+private fun isConversationEntry(entry: dev.local.codexlink.data.TimelineEntry): Boolean {
+    val body = entry.body.trim()
+    if (body.isBlank()) return false
+    val type = entry.type.lowercase()
+    return when {
+        type == "local/usermessage" -> true
+        type.contains("agentmessage") -> true
+        type == "error" -> true
+        type == "warning" && !body.contains("falling back from websockets", ignoreCase = true) -> true
+        else -> false
+    }
+}
+
+@Composable
+private fun ConversationBubble(entry: dev.local.codexlink.data.TimelineEntry) {
+    val isUser = entry.type == "local/userMessage"
+    val isError = entry.type.equals("error", ignoreCase = true)
+    val isWarning = entry.type.equals("warning", ignoreCase = true)
+    val bubbleColor = when {
+        isUser -> Lime
+        isError -> Color(0xFFFFE2DF)
+        isWarning -> Color(0xFFFFF3C9)
+        else -> Panel
+    }
+    val label = when {
+        isUser -> "你"
+        isError -> "错误"
+        isWarning -> "提示"
+        else -> "Codex"
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
+    ) {
+        Card(
+            modifier = Modifier.fillMaxWidth(0.88f),
+            shape = RoundedCornerShape(18.dp),
+            colors = CardDefaults.cardColors(containerColor = bubbleColor),
+        ) {
+            Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+                Text(label, fontWeight = FontWeight.Bold, color = if (isError) Color(0xFF9C342B) else Ink)
+                Text(
+                    entry.body.trim(),
+                    modifier = Modifier.padding(top = 6.dp),
+                    color = Ink,
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+            }
+        }
+    }
 }
 
 @Composable

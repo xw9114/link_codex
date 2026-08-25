@@ -178,6 +178,7 @@ class CodexLinkRepository @Inject constructor(
         }).jsonObject
         val threadId = threadStart["thread"]?.jsonObject?.get("id")?.jsonPrimitive?.content
             ?: error("Companion 未返回 threadId")
+        appendLocalMessage(threadId, prompt)
         rpc.call("turn/start", buildJsonObject {
             put("threadId", threadId)
             put("input", buildJsonArray { add(buildJsonObject { put("type", "text"); put("text", prompt) }) })
@@ -194,15 +195,25 @@ class CodexLinkRepository @Inject constructor(
         put("includeTurns", true)
     })
 
-    suspend fun steer(threadId: String, text: String) = rpc.call("turn/steer", buildJsonObject {
-        put("threadId", threadId)
-        put("input", buildJsonArray { add(buildJsonObject { put("type", "text"); put("text", text) }) })
-    })
+    suspend fun steer(threadId: String, text: String) {
+        val cleanText = text.trim()
+        require(cleanText.isNotBlank()) { "请输入追加内容" }
+        rpc.call("turn/steer", buildJsonObject {
+            put("threadId", threadId)
+            put("input", buildJsonArray { add(buildJsonObject { put("type", "text"); put("text", cleanText) }) })
+        })
+        appendLocalMessage(threadId, cleanText)
+    }
 
-    suspend fun queueTurn(threadId: String, text: String) = rpc.call("turn/start", buildJsonObject {
-        put("threadId", threadId)
-        put("input", buildJsonArray { add(buildJsonObject { put("type", "text"); put("text", text) }) })
-    })
+    suspend fun queueTurn(threadId: String, text: String) {
+        val cleanText = text.trim()
+        require(cleanText.isNotBlank()) { "请输入排队内容" }
+        rpc.call("turn/start", buildJsonObject {
+            put("threadId", threadId)
+            put("input", buildJsonArray { add(buildJsonObject { put("type", "text"); put("text", cleanText) }) })
+        })
+        appendLocalMessage(threadId, cleanText)
+    }
 
     suspend fun interrupt(threadId: String, turnId: String) = rpc.call("turn/interrupt", buildJsonObject {
         put("threadId", threadId)
@@ -252,22 +263,32 @@ class CodexLinkRepository @Inject constructor(
             val requestId = message.getValue("id").jsonPrimitive.content
             approvalDao.upsert(ApprovalEntity(requestId, threadId, method, message.toString(), System.currentTimeMillis()))
         }
-        if (threadId.isNotBlank()) appendTimeline(threadId, timelineEntry(method, threadId, params))
+        if (threadId.isNotBlank()) {
+            val timelineParams = message["error"]?.let { error ->
+                buildJsonObject {
+                    params.forEach { (key, value) -> put(key, value) }
+                    put("error", error)
+                }
+            } ?: params
+            appendTimeline(threadId, timelineEntry(method, threadId, timelineParams))
+        }
         if (method == "thread/started" || method == "thread/status/changed" || method == "turn/completed") {
             runCatching { refreshThreads() }
         }
     }
 
     private fun timelineEntry(method: String, threadId: String, params: JsonObject): TimelineEntry {
-        val delta = params["delta"]?.jsonPrimitive?.contentOrNull
-            ?: params["text"]?.jsonPrimitive?.contentOrNull
-            ?: params["message"]?.jsonPrimitive?.contentOrNull
+        val delta = textValue(params["delta"])
+            ?: textValue(params["text"])
+            ?: textValue(params["message"])
             ?: params["item"]?.jsonObject?.let { item ->
-                item["text"]?.jsonPrimitive?.contentOrNull
-                    ?: item["output"]?.jsonPrimitive?.contentOrNull
-                    ?: item["command"]?.jsonPrimitive?.contentOrNull
-                    ?: item["diff"]?.jsonPrimitive?.contentOrNull
-            }.orEmpty()
+                textValue(item["text"])
+                    ?: textValue(item["output"])
+                    ?: textValue(item["command"])
+                    ?: textValue(item["diff"])
+            }
+            ?: textValue(params["error"])
+            ?: ""
         val title = when {
             method.endsWith("requestApproval") -> "等待审批"
             method.contains("commandExecution") -> "命令"
@@ -286,6 +307,29 @@ class CodexLinkRepository @Inject constructor(
             title = title,
             body = delta,
             raw = params,
+        )
+    }
+
+    private fun textValue(value: JsonElement?): String? = runCatching {
+        when (value) {
+            null -> null
+            is JsonObject -> sequenceOf("text", "output", "message", "command", "diff", "error")
+                .mapNotNull { key -> textValue(value[key]) }
+                .firstOrNull()
+            else -> value.jsonPrimitive.contentOrNull
+        }
+    }.getOrNull()?.takeIf(String::isNotBlank)
+
+    private fun appendLocalMessage(threadId: String, text: String) {
+        appendTimeline(
+            threadId,
+            TimelineEntry(
+                stableId = "local-${System.nanoTime()}",
+                threadId = threadId,
+                type = "local/userMessage",
+                title = "你",
+                body = text.trim(),
+            ),
         )
     }
 

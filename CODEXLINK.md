@@ -21,7 +21,10 @@ keys, HKDF-SHA256, AES-256-GCM and replay sequencing).
   The packaged installer includes the Relay/Bridge `ws` runtime dependency;
   no separate Node.js or npm installation is required on the target PC.
 - `android/`: Kotlin/Compose client (`minSdk 29`) with QR pairing, foreground
-  reconnect service, encrypted Room cache and task/approval UI.
+  reconnect service, encrypted Room cache and a conversation-style task UI.
+  Intermediate command, MCP and protocol events are hidden from the main
+  timeline; the phone shows user messages, Codex replies, necessary errors and
+  approval cards instead.
 - `protocol/`: shared secure-transport test vectors.
 - `phodex-bridge/` and `relay/`: Remodex bridge/relay integration used by the
   Companion.
@@ -71,11 +74,17 @@ For the current local build, copies are also in `dist/`:
 | --- | --- |
 | `dist/CodexLink-Companion-0.1.0-x64.exe` | `7915A3AC38BC250A4397788277DC26ABBA59004149DFCD2DC7A3E30484F31278` |
 | `dist/CodexLink-Android-0.1.1-debug.apk` | `EC046142EA0E9BBA90A72D38F617832AAA3E819DA111510B63C813B8A2B900F9` |
+| `dist/CodexLink-Android-0.1.2-debug.apk` | `D3E6634344A452F1D8085658382DE32E5DA33FC200CDDD742D7A1E4886E01D97` |
 
 The Android 0.1.1 build serializes encrypted WebSocket sends and suppresses
 duplicate reconnect callbacks. This prevents the initial `initialize` and
 `project/list` requests from racing during handshake and leaving the phone in
 an online/reconnecting loop.
+
+The Android 0.1.2 build presents tasks as a chat: the original prompt and
+follow-up messages appear on the right, Codex responses appear on the left,
+and intermediate command/MCP/status protocol events are hidden. Approval
+requests remain available because they require an explicit phone decision.
 
 ## Install and pair
 
