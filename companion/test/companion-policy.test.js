@@ -104,6 +104,49 @@ test("thread-bound requests fail cleanly after the project is removed", (t) => {
   // Removing the project through the same store used by the policy models the
   // desktop allowlist UI. The stale thread authorization must not throw.
   f.projectStore.remove(f.project.id);
-  f.policy.handleInbound(JSON.stringify({ id: 31, method: "thread/read", params: { threadId: "allowed-thread" } }), f.context);
+  f.policy.handleInbound(JSON.stringify({ id: 31, method: "turn/start", params: { threadId: "allowed-thread" } }), f.context);
   assert.equal(f.sent.at(-1).error.code, "project_not_allowed");
+  assert.equal(f.policy.snapshot().activeTurnCount, 0);
+});
+
+test("approval is invalidated when its project is removed or turn completes", (t) => {
+  const f = createFixture(t);
+  f.policy.handleInbound(JSON.stringify({ id: 40, method: "thread/list", params: {} }), f.context);
+  f.policy.filterOutbound(JSON.stringify({
+    id: 40,
+    result: { data: [{ id: "allowed-thread", cwd: f.allowed }] },
+  }));
+  f.policy.filterOutbound(JSON.stringify({
+    id: 41,
+    method: "item/commandExecution/requestApproval",
+    params: { threadId: "allowed-thread" },
+  }));
+  assert.equal(f.policy.snapshot().pendingApprovalCount, 1);
+
+  f.projectStore.remove(f.project.id);
+  f.policy.handleInbound(JSON.stringify({
+    id: 42,
+    method: "approval/respond",
+    params: { requestId: "41", decision: "accept" },
+  }), f.context);
+  assert.equal(f.sent.at(-1).error.code, "project_not_allowed");
+  assert.equal(f.policy.snapshot().pendingApprovalCount, 0);
+
+  const restored = f.projectStore.add(f.allowed);
+  f.policy.handleInbound(JSON.stringify({ id: 43, method: "thread/list", params: {} }), f.context);
+  f.policy.filterOutbound(JSON.stringify({
+    id: 43,
+    result: { data: [{ id: "next-thread", cwd: f.allowed, codexlinkProjectId: restored.id }] },
+  }));
+  f.policy.filterOutbound(JSON.stringify({
+    id: 44,
+    method: "item/fileChange/requestApproval",
+    params: { threadId: "next-thread" },
+  }));
+  assert.equal(f.policy.snapshot().pendingApprovalCount, 1);
+  f.policy.filterOutbound(JSON.stringify({
+    method: "turn/completed",
+    params: { threadId: "next-thread" },
+  }));
+  assert.equal(f.policy.snapshot().pendingApprovalCount, 0);
 });

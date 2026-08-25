@@ -15,6 +15,7 @@ data class PairingPayload(
     val displayName: String = "",
     val tlsCertSha256: String,
     val tlsSpkiSha256: String,
+    val relayAlternates: List<String> = emptyList(),
     val client: String? = null,
 )
 

@@ -8,6 +8,7 @@ import androidx.room.OnConflictStrategy
 import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.RoomDatabase
+import androidx.room.Transaction
 import kotlinx.coroutines.flow.Flow
 
 @Entity(tableName = "hosts")
@@ -73,6 +74,12 @@ interface ThreadDao {
 
     @Query("DELETE FROM threads")
     suspend fun clear()
+
+    @Transaction
+    suspend fun replaceAll(threads: List<ThreadEntity>) {
+        clear()
+        upsertAll(threads)
+    }
 }
 
 @Dao
@@ -85,6 +92,12 @@ interface ApprovalDao {
 
     @Query("DELETE FROM approvals WHERE requestId = :requestId")
     suspend fun delete(requestId: String)
+
+    @Query("DELETE FROM approvals WHERE threadId = :threadId")
+    suspend fun deleteByThread(threadId: String)
+
+    @Query("DELETE FROM approvals")
+    suspend fun clear()
 }
 
 @Database(entities = [HostEntity::class, ThreadEntity::class, ApprovalEntity::class], version = 1, exportSchema = true)

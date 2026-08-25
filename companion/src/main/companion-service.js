@@ -6,6 +6,7 @@ const os = require("os");
 const path = require("path");
 const { promisify } = require("util");
 const QRCode = require("qrcode");
+const { version: COMPANION_VERSION } = require("../../package.json");
 const { AtomicJsonStore } = require("../core/atomic-json-store");
 const { createCompanionPolicy } = require("../core/companion-policy");
 const { WindowsCredentialManager } = require("../core/credential-manager");
@@ -155,6 +156,8 @@ class CompanionService extends EventEmitter {
     this.login = null;
     this.providerRestartPending = false;
     this.networkRefreshPromise = null;
+    this.bridgeRestartPromise = null;
+    this.stopping = false;
     this.monitorTimer = null;
     this.restartTimer = null;
     this.logs = [];
@@ -174,6 +177,7 @@ class CompanionService extends EventEmitter {
   }
 
   async start() {
+    this.stopping = false;
     this.log("info", "正在检查 Codex 与 Tailscale");
     process.env.REMODEX_DEVICE_STATE_DIR = path.join(this.userDataPath, "pairing");
     this.ensureRelaySessionId();
@@ -187,9 +191,11 @@ class CompanionService extends EventEmitter {
   }
 
   async startNetworkStack() {
+    if (this.stopping) return;
     this.tailnet = await readTailscaleStatus();
+    if (this.stopping) return;
     const relayModulePath = this.resolveModulePath("relay", "server.js");
-    this.relay = await startPrivateRelay({
+    const relay = await startPrivateRelay({
       bindHost: this.tailnet.preferredAddress,
       // Put the direct TailIP in the mobile pairing payload. MagicDNS can be
       // disabled or intercepted by Android private-DNS/OEM VPN settings even
@@ -201,11 +207,24 @@ class CompanionService extends EventEmitter {
       stateDirectory: path.join(this.userDataPath, "tls"),
       relayModulePath,
     });
-    await this.startBridge();
-    this.log("info", `仅在 Tailnet 地址 ${this.tailnet.preferredAddress}:${this.relay.port} 监听`);
+    this.relay = relay;
+    try {
+      await this.startBridge();
+      if (this.stopping) {
+        await relay.stop();
+        if (this.relay === relay) this.relay = null;
+        return;
+      }
+      this.log("info", `仅在 Tailnet 地址 ${this.tailnet.preferredAddress}:${relay.port} 监听`);
+    } catch (error) {
+      await relay.stop();
+      if (this.relay === relay) this.relay = null;
+      throw error;
+    }
   }
 
   async startBridge() {
+    if (this.stopping || !this.relay) return;
     const generation = ++this.bridgeGeneration;
     const bridgeModulePath = this.resolveModulePath("phodex-bridge", "src", "bridge.js");
     delete require.cache[require.resolve(bridgeModulePath)];
@@ -250,11 +269,14 @@ class CompanionService extends EventEmitter {
   }
 
   async stop() {
+    this.stopping = true;
     this.bridgeGeneration += 1;
     clearInterval(this.monitorTimer);
     clearTimeout(this.restartTimer);
     this.monitorTimer = null;
     this.restartTimer = null;
+    await this.bridgeRestartPromise?.catch(() => {});
+    await this.networkRefreshPromise?.catch(() => {});
     this.bridge?.stop();
     this.bridge = null;
     await this.relay?.stop();
@@ -265,16 +287,30 @@ class CompanionService extends EventEmitter {
   }
 
   async restartBridge() {
-    // Invalidate callbacks before stopping the old instance. Its relay close
-    // and QR callbacks can otherwise arrive during the restart window.
-    this.bridgeGeneration += 1;
-    this.bridge?.stop();
-    this.bridge = null;
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    await this.startBridge();
+    if (this.bridgeRestartPromise) return this.bridgeRestartPromise;
+    this.bridgeRestartPromise = (async () => {
+      // A Tailnet refresh owns both relay and bridge. Wait for it before
+      // touching the bridge so timer refresh, trust reset and provider updates
+      // cannot create two live bridge instances against one relay.
+      if (this.networkRefreshPromise) await this.networkRefreshPromise;
+      if (this.stopping) return;
+      // Invalidate callbacks before stopping the old instance. Its relay close
+      // and QR callbacks can otherwise arrive during the restart window.
+      this.bridgeGeneration += 1;
+      this.bridge?.stop();
+      this.bridge = null;
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      if (!this.stopping && this.relay) await this.startBridge();
+    })().finally(() => {
+      this.bridgeRestartPromise = null;
+    });
+    return this.bridgeRestartPromise;
   }
 
   async refreshNetwork() {
+    if (this.stopping) return;
+    if (this.bridgeRestartPromise) await this.bridgeRestartPromise;
+    if (this.stopping) return;
     if (this.networkRefreshPromise) return this.networkRefreshPromise;
     this.networkRefreshPromise = (async () => {
       try {
@@ -283,15 +319,17 @@ class CompanionService extends EventEmitter {
         // Electron.  Re-check the local runtime before rebuilding the stack.
         if (!this.codex) {
           this.codex = await readCodexInstallation();
-          this.login = await readCodexLoginStatus({ codexPath: this.codex.executable });
           await this.providerStore.initialize();
         }
+        this.login = await readCodexLoginStatus({ codexPath: this.codex.executable });
         const next = await readTailscaleStatus();
+        if (this.stopping) return;
         if (this.tailnet?.preferredAddress !== next.preferredAddress
             || this.tailnet?.dnsName !== next.dnsName
             || !this.relay
             || !this.bridge) {
           this.log("info", "Tailnet 地址变化，正在重建私网监听");
+          this.bridgeGeneration += 1;
           this.bridge?.stop();
           this.bridge = null;
           await this.relay?.stop();
@@ -305,6 +343,7 @@ class CompanionService extends EventEmitter {
         // Do not leave a stale relay/bridge running after Tailscale has gone
         // away.  It would make the desktop UI say "unavailable" while the old
         // socket and QR endpoint remained alive until the OS reclaimed them.
+        this.bridgeGeneration += 1;
         this.bridge?.stop();
         this.bridge = null;
         await this.relay?.stop().catch(() => {});
@@ -380,14 +419,18 @@ class CompanionService extends EventEmitter {
   markProviderRestartPending() {
     this.providerRestartPending = true;
     clearTimeout(this.restartTimer);
-    this.restartTimer = setTimeout(() => void this.restartCodexIfIdle(), 500);
+    this.restartTimer = setTimeout(() => {
+      void this.restartCodexIfIdle().catch((error) => this.log("warn", `Provider 重启失败：${error.message}`));
+    }, 500);
     this.emitState();
   }
 
   async restartCodexIfIdle() {
-    if (!this.providerRestartPending || !this.bridge) return;
+    if (this.stopping || !this.providerRestartPending || !this.bridge) return;
     if ((this.policy?.snapshot().activeTurnCount || 0) > 0) {
-      this.restartTimer = setTimeout(() => void this.restartCodexIfIdle(), 2_000);
+      this.restartTimer = setTimeout(() => {
+        void this.restartCodexIfIdle().catch((error) => this.log("warn", `Provider 重启失败：${error.message}`));
+      }, 2_000);
       return;
     }
     const env = await this.providerStore.buildEnvironment(process.env);
@@ -409,6 +452,9 @@ class CompanionService extends EventEmitter {
     const pairingPayload = {
       ...session.pairingPayload,
       relay: relay.relayUrl,
+      relayAlternates: this.tailnet?.dnsName
+        ? [`wss://${this.tailnet.dnsName}:${relay.port}/relay`]
+        : [],
       tlsCertSha256: relay.certSha256,
       tlsSpkiSha256: relay.spkiSha256,
       client: "codexlink_android",
@@ -425,7 +471,7 @@ class CompanionService extends EventEmitter {
 
   publicStatus() {
     return {
-      appVersion: "0.1.0",
+      appVersion: COMPANION_VERSION,
       hostName: this.tailnet?.hostName || os.hostname(),
       tailnet: this.tailnet ? {
         state: "Running",

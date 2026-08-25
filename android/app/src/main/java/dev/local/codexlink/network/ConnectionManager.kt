@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
@@ -47,10 +48,8 @@ class ConnectionManager @Inject constructor(
     private val json = Json { ignoreUnknownKeys = true }
     private val mutableState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     private val mutableApplications = MutableSharedFlow<String>(extraBufferCapacity = 256)
-    private val mutableReadyEvents = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
     val state: StateFlow<ConnectionState> = mutableState
     val applications: SharedFlow<String> = mutableApplications
-    val readyEvents: SharedFlow<Unit> = mutableReadyEvents
 
     private var socket: WebSocket? = null
     private var transport: SecureTransport? = null
@@ -62,13 +61,27 @@ class ConnectionManager @Inject constructor(
     // together. initialize(), refreshAll() and notification responses can be
     // launched from different coroutines immediately after a handshake.
     private val sendLock = Any()
+    private val replayUpdates = Channel<ReplayUpdate>(Channel.UNLIMITED)
 
+    init {
+        // Room writes are serialized in the same order as accepted relay
+        // events. Launching one coroutine per event can otherwise persist an
+        // older cursor after a newer one and replay duplicate notifications.
+        scope.launch {
+            for (update in replayUpdates) {
+                hostDao.updateReplayCursor(update.hostId, update.sequence, update.epoch)
+            }
+        }
+    }
+
+    @Synchronized
     fun start() {
         stopped = false
-        if (connectJob?.isActive == true || socket != null) return
+        if (connectJob?.isActive == true || reconnectJob?.isActive == true || socket != null) return
         connectJob = scope.launch { connectOnce() }
     }
 
+    @Synchronized
     fun stop() {
         stopped = true
         connectJob?.cancel()
@@ -106,7 +119,9 @@ class ConnectionManager @Inject constructor(
                 Base64.getDecoder().decode(pairing.tlsCertSha256),
                 Base64.getDecoder().decode(pairing.tlsSpkiSha256),
             )
-            val endpoint = "${pairing.relay.trimEnd('/')}/${pairing.sessionId}"
+            val relayCandidates = (listOf(pairing.relay) + pairing.relayAlternates).distinct()
+            val relayBase = relayCandidates[(attempt - 1).mod(relayCandidates.size)]
+            val endpoint = "${relayBase.trimEnd('/')}/${pairing.sessionId}"
             val request = Request.Builder().url(endpoint).header("x-role", "android").build()
             socket = client.newWebSocket(request, Listener(host, pairing))
         } catch (error: CancellationException) {
@@ -116,6 +131,7 @@ class ConnectionManager @Inject constructor(
         }
     }
 
+    @Synchronized
     private fun scheduleReconnect(reason: String) {
         if (stopped) return
         if (reconnectJob?.isActive == true) return
@@ -129,8 +145,12 @@ class ConnectionManager @Inject constructor(
         connectJob?.cancel()
         reconnectJob = scope.launch {
             delay(delayMs + (0..750).random())
-            reconnectJob = null
-            if (!stopped && socket == null) connectOnce()
+            synchronized(this@ConnectionManager) {
+                reconnectJob = null
+                if (!stopped && socket == null && connectJob?.isActive != true) {
+                    connectJob = scope.launch { connectOnce() }
+                }
+            }
         }
     }
 
@@ -138,7 +158,14 @@ class ConnectionManager @Inject constructor(
         private val host: dev.local.codexlink.data.HostEntity,
         private val pairing: PairingPayload,
     ) : WebSocketListener() {
+        private var lastAppliedSequence = host.lastAppliedBridgeOutboundSeq
+        private var lastAppliedEpoch = host.bridgeReplayEpoch
+
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            if (stopped || socket !== webSocket) {
+                webSocket.close(1000, "Stale CodexLink socket")
+                return
+            }
             mutableState.value = ConnectionState.Handshaking(pairing.displayName)
             val secureTransport = SecureTransport(identityStore.load())
             transport = secureTransport
@@ -147,30 +174,52 @@ class ConnectionManager @Inject constructor(
                 trustedReconnect = host.lastConnectedAt != null,
                 cursor = ReplayCursor(host.lastAppliedBridgeOutboundSeq, host.bridgeReplayEpoch),
             )
-            webSocket.send(hello)
+            if (!webSocket.send(hello)) scheduleReconnect("WebSocket handshake send failed")
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
             if (socket !== webSocket) return
             val active = transport ?: return
-            active.handleWire(text).forEach { event ->
+            for (event in active.handleWire(text)) {
                 when (event) {
-                    is SecureEvent.SendWire -> webSocket.send(event.text)
+                    is SecureEvent.SendWire -> {
+                        if (!webSocket.send(event.text)) {
+                            scheduleReconnect("WebSocket handshake send failed")
+                            return
+                        }
+                    }
                     is SecureEvent.Ready -> {
                         attempt = 0
                         mutableState.value = ConnectionState.Ready(pairing.displayName)
                         scope.launch { hostDao.markConnected(host.macDeviceId, System.currentTimeMillis()) }
-                        mutableReadyEvents.tryEmit(Unit)
                     }
                     is SecureEvent.Application -> {
                         val sequence = event.bridgeOutboundSeq
-                        if (sequence != null && sequence <= host.lastAppliedBridgeOutboundSeq) return@forEach
-                        if (mutableApplications.tryEmit(event.text) && sequence != null) {
-                            scope.launch { hostDao.updateReplayCursor(host.macDeviceId, sequence, event.bridgeReplayEpoch) }
+                        if (sequence != null
+                            && event.bridgeReplayEpoch == lastAppliedEpoch
+                            && sequence <= lastAppliedSequence) {
+                            continue
+                        }
+                        if (!mutableApplications.tryEmit(event.text)) {
+                            // Do not acknowledge a dropped application event.
+                            // Reconnect with the last persisted cursor so the
+                            // bridge can replay it in order.
+                            scheduleReconnect("手机事件缓冲区已满，正在重连补发")
+                            return
+                        }
+                        if (sequence != null) {
+                            lastAppliedSequence = sequence
+                            lastAppliedEpoch = event.bridgeReplayEpoch
+                            replayUpdates.trySend(ReplayUpdate(
+                                host.macDeviceId,
+                                sequence,
+                                event.bridgeReplayEpoch,
+                            ))
                         }
                     }
                     is SecureEvent.Error -> {
                         scheduleReconnect("${event.code}: ${event.message}")
+                        return
                     }
                 }
             }
@@ -188,4 +237,6 @@ class ConnectionManager @Inject constructor(
             if (!stopped && socket === webSocket) scheduleReconnect(t.message ?: "网络不可用")
         }
     }
+
+    private data class ReplayUpdate(val hostId: String, val sequence: Long, val epoch: String)
 }

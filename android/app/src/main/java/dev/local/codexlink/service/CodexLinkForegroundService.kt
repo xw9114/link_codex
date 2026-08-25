@@ -24,6 +24,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 
 @AndroidEntryPoint
 class CodexLinkForegroundService : Service() {
@@ -49,15 +52,19 @@ class CodexLinkForegroundService : Service() {
         }
         scope.launch {
             repository.events.collect { message ->
-                val method = message["method"]?.toString()?.trim('"').orEmpty()
-                val params = message["params"]
-                val threadId = params?.let { raw ->
-                    Regex("\"threadId\"\\s*:\\s*\"([^\"]+)\"").find(raw.toString())?.groupValues?.get(1)
-                }.orEmpty()
+                val method = (message["method"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+                val params = message["params"] as? JsonObject
+                val turn = params?.get("turn") as? JsonObject
+                val threadId = listOf(params?.get("threadId"), turn?.get("threadId"))
+                    .firstNotNullOfOrNull { (it as? JsonPrimitive)?.contentOrNull }
+                    .orEmpty()
+                val turnStatus = listOf(params?.get("status"), turn?.get("status"))
+                    .firstNotNullOfOrNull { (it as? JsonPrimitive)?.contentOrNull }
+                    .orEmpty()
                 when {
                     method.endsWith("requestApproval") -> postEvent("Codex 等待审批", "点按查看命令或文件修改", threadId, 2001)
-                    method == "turn/completed" && message.toString().contains("failed") -> postEvent("Codex 任务失败", "点按查看错误", threadId, 2002)
-                    method == "turn/completed" -> postEvent("Codex 任务完成", "点按查看结果与 diff", threadId, 2003)
+                    method == "turn/completed" && turnStatus.equals("failed", ignoreCase = true) -> postEvent("Codex 任务失败", "点按查看错误", threadId, 2002)
+                    method == "turn/completed" -> postEvent("Codex 任务完成", "点按查看对话结果", threadId, 2003)
                 }
             }
         }

@@ -66,16 +66,17 @@ npm ci
 npm run dist
 ```
 
-The installer is `companion/dist/CodexLink-Companion-0.1.0-x64.exe`.
+The installer is `companion/dist/CodexLink-Companion-0.1.1-x64.exe`.
 
 For the current local build, copies are also in `dist/`:
 
 | Artifact | SHA-256 |
 | --- | --- |
-| `dist/CodexLink-Companion-0.1.0-x64.exe` | `7915A3AC38BC250A4397788277DC26ABBA59004149DFCD2DC7A3E30484F31278` |
+| `dist/CodexLink-Companion-0.1.1-x64.exe` | `C6E954DBF0777D94C244F977FC275F4BF3EDFAC6DEFF4D3A9A184E22DCD7AD98` |
 | `dist/CodexLink-Android-0.1.1-debug.apk` | `EC046142EA0E9BBA90A72D38F617832AAA3E819DA111510B63C813B8A2B900F9` |
 | `dist/CodexLink-Android-0.1.2-debug.apk` | `D3E6634344A452F1D8085658382DE32E5DA33FC200CDDD742D7A1E4886E01D97` |
 | `dist/CodexLink-Android-0.1.3-debug.apk` | `3CD82548B79551D355F1A352913335623CDD645354B8D7CB184C7D32A5500CB0` |
+| `dist/CodexLink-Android-0.1.4-debug.apk` | `180A0E9D12A570C26A8AA9042BBF01D80E8B9AA654B12170483783A3A1DE2961` |
 
 The Android 0.1.1 build serializes encrypted WebSocket sends and suppresses
 duplicate reconnect callbacks. This prevents the initial `initialize` and
@@ -90,6 +91,17 @@ requests remain available because they require an explicit phone decision.
 The Android 0.1.3 build also makes streaming list keys unique across event
 types. This prevents a fast pair of agent-message delta/completion events from
 causing a Compose duplicate-key crash while a task is running.
+
+Android 0.1.4 and Companion 0.1.1 include a connection-lifecycle audit. The
+Android client no longer misses Codex initialization when E2EE becomes ready
+before the UI subscribes, serializes replay-cursor persistence, reconnects
+instead of acknowledging dropped event bursts, hydrates real conversation
+history through `thread/read`, clears stale pairing approvals/caches, refreshes
+project/provider metadata in parallel and rotates between the pinned TailIP
+and MagicDNS endpoint. The Companion serializes Tailnet and Bridge restarts,
+cleans Relay resources after bind failures, invalidates approvals when their
+project or turn disappears and rechecks the allowlist before every thread-bound
+request.
 
 ## Install and pair
 

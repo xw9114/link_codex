@@ -8,10 +8,18 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -44,12 +52,15 @@ class CodexLinkRepository @Inject constructor(
     private val mutableThreads = MutableStateFlow<List<ThreadSummary>>(emptyList())
     private val mutableHostPermissions = MutableStateFlow(HostPermissions())
     private val mutableTimelines = MutableStateFlow<Map<String, List<TimelineEntry>>>(emptyMap())
+    private val timelineLock = Any()
+    private var threadRefreshJob: Job? = null
     val projects: StateFlow<List<ProjectProfile>> = mutableProjects
     val providers: StateFlow<List<ProviderProfile>> = mutableProviders
     val threads: StateFlow<List<ThreadSummary>> = mutableThreads
     val hostPermissions: StateFlow<HostPermissions> = mutableHostPermissions
     val timelines: StateFlow<Map<String, List<TimelineEntry>>> = mutableTimelines
     val connectionState: StateFlow<ConnectionState> = connection.state
+    val rpcInitialized: StateFlow<Boolean> = rpc.initialized
     val events = rpc.notifications
     val approvals = approvalDao.observeAll()
     val activeHost = hostDao.observeActive()
@@ -66,7 +77,10 @@ class CodexLinkRepository @Inject constructor(
         }
         scope.launch { rpc.notifications.collect(::handleNotification) }
         scope.launch {
-            connection.readyEvents.collect {
+            // StateFlow replays the current initialized state. A one-shot
+            // event can be emitted before the repository collector starts,
+            // leaving the UI online but with no projects or providers.
+            rpc.initialized.filter { it }.collect {
                 runCatching { refreshAll() }
             }
         }
@@ -76,9 +90,8 @@ class CodexLinkRepository @Inject constructor(
         val payload = json.decodeFromString<PairingPayload>(rawPayload)
         require(payload.v == 2) { "不支持的配对协议版本" }
         require(payload.expiresAt >= System.currentTimeMillis()) { "二维码已过期，请在电脑重新生成" }
-        val relay = URI(payload.relay)
-        require(relay.scheme == "wss" && relay.host != null) { "配对地址必须使用 WSS" }
-        require(isTailnetHost(relay.host)) { "配对地址必须是 Tailscale Tailnet 地址" }
+        val relay = validateTailnetRelay(payload.relay)
+        payload.relayAlternates.forEach(::validateTailnetRelay)
         require(payload.tlsCertSha256.isNotBlank() && payload.tlsSpkiSha256.isNotBlank()) { "二维码缺少 TLS 指纹" }
         require(runCatching { java.util.Base64.getDecoder().decode(payload.tlsCertSha256).size == 32 }.getOrDefault(false)) {
             "二维码中的 TLS 证书指纹无效"
@@ -87,6 +100,17 @@ class CodexLinkRepository @Inject constructor(
             "二维码中的 TLS 公钥指纹无效"
         }
         val existing = hostDao.active()?.takeIf { it.macDeviceId == payload.macDeviceId }
+        // A QR scan establishes a fresh one-host session. Do not let cached
+        // projects, tasks or approvals from the previous pairing leak into the
+        // new host while the first refresh is still in flight.
+        connection.stop()
+        hostDao.clear()
+        threadDao.clear()
+        approvalDao.clear()
+        mutableProjects.value = emptyList()
+        mutableProviders.value = emptyList()
+        mutableThreads.value = emptyList()
+        mutableTimelines.value = emptyMap()
         hostDao.upsert(HostEntity(
             macDeviceId = payload.macDeviceId,
             displayName = payload.displayName.ifBlank { relay.host },
@@ -99,7 +123,6 @@ class CodexLinkRepository @Inject constructor(
             lastAppliedBridgeOutboundSeq = existing?.lastAppliedBridgeOutboundSeq ?: 0,
             bridgeReplayEpoch = existing?.bridgeReplayEpoch ?: "",
         ))
-        connection.stop()
         connection.start()
     }
 
@@ -107,6 +130,7 @@ class CodexLinkRepository @Inject constructor(
         connection.stop()
         hostDao.clear()
         threadDao.clear()
+        approvalDao.clear()
         mutableProjects.value = emptyList()
         mutableProviders.value = emptyList()
         mutableThreads.value = emptyList()
@@ -117,10 +141,17 @@ class CodexLinkRepository @Inject constructor(
     fun disconnect() = connection.stop()
 
     suspend fun refreshAll() {
-        refreshHostStatus()
-        refreshProjects()
-        refreshProviders()
-        refreshThreads()
+        awaitRpcInitialized()
+        // Project/provider metadata is Companion-local and should not wait for
+        // a potentially slower Codex thread/list call over the same Tailnet.
+        coroutineScope {
+            listOf(
+                async { refreshHostStatus() },
+                async { refreshProjects() },
+                async { refreshProviders() },
+                async { refreshThreads() },
+            ).awaitAll()
+        }
     }
 
     suspend fun refreshHostStatus() {
@@ -146,7 +177,7 @@ class CodexLinkRepository @Inject constructor(
         val rows = rpc.call("thread/list", buildJsonObject { put("limit", 100) }).rows()
         val summaries = rows.mapNotNull(::threadSummary)
         mutableThreads.value = summaries
-        threadDao.upsertAll(summaries.map { summary ->
+        threadDao.replaceAll(summaries.map { summary ->
             ThreadEntity(
                 id = summary.id,
                 projectId = summary.codexlinkProjectId.orEmpty(),
@@ -195,6 +226,31 @@ class CodexLinkRepository @Inject constructor(
         put("includeTurns", true)
     })
 
+    suspend fun hydrateThread(threadId: String) {
+        awaitRpcInitialized()
+        val history = historyEntries(threadId, readThread(threadId))
+        if (history.isEmpty()) return
+        synchronized(timelineLock) {
+            val current = mutableTimelines.value.toMutableMap()
+            val liveRows = current[threadId].orEmpty()
+            // Match by occurrence count rather than a Set. Repeating the same
+            // prompt twice is valid and must remain two separate chat turns.
+            val liveCounts = liveRows.groupingBy(::conversationContentKey).eachCount().toMutableMap()
+            val missingHistory = history.filter { entry ->
+                val key = conversationContentKey(entry)
+                val remaining = liveCounts[key] ?: 0
+                if (remaining > 0) {
+                    if (remaining == 1) liveCounts.remove(key) else liveCounts[key] = remaining - 1
+                    false
+                } else {
+                    true
+                }
+            }
+            current[threadId] = (missingHistory + liveRows).takeLast(1_000)
+            mutableTimelines.value = current
+        }
+    }
+
     suspend fun steer(threadId: String, text: String) {
         val cleanText = text.trim()
         require(cleanText.isNotBlank()) { "请输入追加内容" }
@@ -230,7 +286,14 @@ class CodexLinkRepository @Inject constructor(
         interrupt(threadId, activeTurnId)
     }
 
-    suspend fun archive(threadId: String) = rpc.call("thread/archive", buildJsonObject { put("threadId", threadId) })
+    suspend fun archive(threadId: String): JsonElement {
+        val result = rpc.call("thread/archive", buildJsonObject { put("threadId", threadId) })
+        approvalDao.deleteByThread(threadId)
+        synchronized(timelineLock) {
+            mutableTimelines.value = mutableTimelines.value - threadId
+        }
+        return result
+    }
     suspend fun fork(threadId: String): JsonElement = rpc.call("thread/fork", buildJsonObject { put("threadId", threadId) })
 
     suspend fun respondApproval(requestId: String, decision: String) {
@@ -249,15 +312,21 @@ class CodexLinkRepository @Inject constructor(
         refreshProviders()
     }
 
-    suspend fun testProvider(id: String): JsonObject = rpc.call("provider/test", buildJsonObject { put("id", id) }).jsonObject
+    suspend fun testProvider(id: String): JsonObject {
+        val result = rpc.call("provider/test", buildJsonObject { put("id", id) }).jsonObject
+        refreshProviders()
+        return result
+    }
 
     private suspend fun handleNotification(message: JsonObject) {
         val method = message["method"]?.jsonPrimitive?.contentOrNull ?: return
-        val params = message["params"]?.jsonObject ?: JsonObject(emptyMap())
-        val threadId = params["threadId"]?.jsonPrimitive?.contentOrNull
-            ?: params["thread_id"]?.jsonPrimitive?.contentOrNull
-            ?: params["turn"]?.jsonObject?.get("threadId")?.jsonPrimitive?.contentOrNull
-            ?: params["item"]?.jsonObject?.get("threadId")?.jsonPrimitive?.contentOrNull
+        val params = message["params"] as? JsonObject ?: JsonObject(emptyMap())
+        val turn = params["turn"] as? JsonObject
+        val item = params["item"] as? JsonObject
+        val threadId = textValue(params["threadId"])
+            ?: textValue(params["thread_id"])
+            ?: textValue(turn?.get("threadId"))
+            ?: textValue(item?.get("threadId"))
             ?: ""
         if (message["id"] != null && method.endsWith("requestApproval")) {
             val requestId = message.getValue("id").jsonPrimitive.content
@@ -272,8 +341,20 @@ class CodexLinkRepository @Inject constructor(
             } ?: params
             appendTimeline(threadId, timelineEntry(method, threadId, timelineParams))
         }
+        if (method == "turn/completed" && threadId.isNotBlank()) {
+            approvalDao.deleteByThread(threadId)
+        }
         if (method == "thread/started" || method == "thread/status/changed" || method == "turn/completed") {
+            scheduleThreadRefresh()
+        }
+    }
+
+    private fun scheduleThreadRefresh() {
+        if (threadRefreshJob?.isActive == true) return
+        threadRefreshJob = scope.launch {
+            delay(250)
             runCatching { refreshThreads() }
+            threadRefreshJob = null
         }
     }
 
@@ -281,7 +362,7 @@ class CodexLinkRepository @Inject constructor(
         val delta = textValue(params["delta"])
             ?: textValue(params["text"])
             ?: textValue(params["message"])
-            ?: params["item"]?.jsonObject?.let { item ->
+            ?: (params["item"] as? JsonObject)?.let { item ->
                 textValue(item["text"])
                     ?: textValue(item["output"])
                     ?: textValue(item["command"])
@@ -299,8 +380,8 @@ class CodexLinkRepository @Inject constructor(
             else -> method
         }
         return TimelineEntry(
-            stableId = params["itemId"]?.jsonPrimitive?.contentOrNull
-                ?: params["item"]?.jsonObject?.get("id")?.jsonPrimitive?.contentOrNull
+            stableId = textValue(params["itemId"])
+                ?: textValue((params["item"] as? JsonObject)?.get("id"))
                 ?: "$method-${System.nanoTime()}",
             threadId = threadId,
             type = method,
@@ -313,7 +394,10 @@ class CodexLinkRepository @Inject constructor(
     private fun textValue(value: JsonElement?): String? = runCatching {
         when (value) {
             null -> null
-            is JsonObject -> sequenceOf("text", "output", "message", "command", "diff", "error")
+            is JsonArray -> value.mapNotNull(::textValue).joinToString("").takeIf(String::isNotBlank)
+            is JsonObject -> sequenceOf(
+                "text", "output", "outputText", "message", "command", "diff", "error", "content",
+            )
                 .mapNotNull { key -> textValue(value[key]) }
                 .firstOrNull()
             else -> value.jsonPrimitive.contentOrNull
@@ -334,21 +418,86 @@ class CodexLinkRepository @Inject constructor(
     }
 
     private fun appendTimeline(threadId: String, entry: TimelineEntry) {
-        val current = mutableTimelines.value.toMutableMap()
-        val rows = current[threadId].orEmpty().toMutableList()
-        val existingIndex = rows.indexOfLast { it.stableId == entry.stableId && it.type == entry.type }
-        if (existingIndex >= 0 && entry.body.isNotEmpty()) {
-            rows[existingIndex] = rows[existingIndex].copy(body = rows[existingIndex].body + entry.body, raw = entry.raw)
-        } else {
-            rows += entry
+        synchronized(timelineLock) {
+            val current = mutableTimelines.value.toMutableMap()
+            val rows = current[threadId].orEmpty().toMutableList()
+            val existingIndex = rows.indexOfLast { it.stableId == entry.stableId && it.type == entry.type }
+            if (existingIndex >= 0 && entry.body.isNotEmpty()) {
+                rows[existingIndex] = rows[existingIndex].copy(body = rows[existingIndex].body + entry.body, raw = entry.raw)
+            } else {
+                rows += entry
+            }
+            current[threadId] = rows.takeLast(1_000)
+            mutableTimelines.value = current
         }
-        current[threadId] = rows.takeLast(1_000)
-        mutableTimelines.value = current
+    }
+
+    private fun historyEntries(threadId: String, result: JsonElement): List<TimelineEntry> {
+        val root = result as? JsonObject ?: return emptyList()
+        val thread = root["thread"] as? JsonObject ?: root
+        val turns = thread["turns"] as? JsonArray ?: return emptyList()
+        return buildList {
+            turns.forEachIndexed { turnIndex, turnValue ->
+                val turn = turnValue as? JsonObject ?: return@forEachIndexed
+                val items = turn["items"] as? JsonArray ?: JsonArray(emptyList())
+                items.forEachIndexed { itemIndex, itemValue ->
+                    val item = itemValue as? JsonObject ?: return@forEachIndexed
+                    val itemType = textValue(item["type"]).orEmpty()
+                    val body = textValue(item).orEmpty().trim()
+                    if (body.isBlank()) return@forEachIndexed
+                    val timelineType = when {
+                        itemType.contains("user", ignoreCase = true) -> "local/userMessage"
+                        itemType.contains("agentMessage", ignoreCase = true)
+                            || itemType.contains("assistant", ignoreCase = true) -> "history/agentMessage"
+                        itemType.contains("error", ignoreCase = true) -> "error"
+                        else -> return@forEachIndexed
+                    }
+                    add(TimelineEntry(
+                        stableId = textValue(item["id"]) ?: "history-$turnIndex-$itemIndex",
+                        threadId = threadId,
+                        type = timelineType,
+                        title = if (timelineType == "local/userMessage") "你" else "Codex",
+                        body = body,
+                        timestamp = turnIndex.toLong() * 10_000 + itemIndex,
+                        raw = item,
+                    ))
+                }
+                val turnError = textValue(turn["error"]).orEmpty().trim()
+                if (turnError.isNotBlank()) {
+                    add(TimelineEntry(
+                        stableId = "history-error-$turnIndex",
+                        threadId = threadId,
+                        type = "error",
+                        title = "错误",
+                        body = turnError,
+                        timestamp = turnIndex.toLong() * 10_000 + 9_999,
+                        raw = turn,
+                    ))
+                }
+            }
+        }
+    }
+
+    private fun conversationContentKey(entry: TimelineEntry): String {
+        val role = if (entry.type == "local/userMessage") "user" else if (entry.type.contains("agentMessage")) "agent" else entry.type
+        return "$role\u0000${entry.body.trim()}"
+    }
+
+    private suspend fun awaitRpcInitialized() {
+        if (rpc.initialized.value) return
+        withTimeout(20_000) { rpc.initialized.filter { it }.first() }
     }
 
     private fun JsonElement.rows(): List<JsonElement> {
         val result = jsonObject
         return (result["data"] ?: result["items"] ?: result["threads"] ?: JsonArray(emptyList())).jsonArray
+    }
+
+    private fun validateTailnetRelay(value: String): URI {
+        val relay = URI(value)
+        require(relay.scheme == "wss" && relay.host != null) { "配对地址必须使用 WSS" }
+        require(isTailnetHost(relay.host)) { "配对地址必须是 Tailscale Tailnet 地址" }
+        return relay
     }
 
     private fun threadSummary(element: JsonElement): ThreadSummary? = runCatching {
@@ -359,8 +508,12 @@ class CodexLinkRepository @Inject constructor(
             preview = row["preview"]?.jsonPrimitive?.contentOrNull.orEmpty(),
             cwd = row["cwd"]?.jsonPrimitive?.contentOrNull.orEmpty(),
             status = row["status"],
-            updatedAt = row["updatedAt"]?.jsonPrimitive?.longOrNull,
+            updatedAt = normalizeEpochMillis(row["updatedAt"]?.jsonPrimitive?.longOrNull),
             codexlinkProjectId = row["codexlinkProjectId"]?.jsonPrimitive?.contentOrNull,
         )
     }.getOrNull()
+
+    private fun normalizeEpochMillis(value: Long?): Long? = value?.let {
+        if (it in 1..999_999_999_999L) it * 1_000 else it
+    }
 }

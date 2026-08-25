@@ -152,31 +152,6 @@ function createCompanionPolicy({
       )));
       return;
     }
-    let params = { ...(parsed.params || {}) };
-    if (parsed.method === "turn/start") {
-      try {
-        params = enforceExecutionSettings(params, authorized.projectPath);
-      } catch (error) {
-        sendResponse(rpcError(parsed.id, error));
-        return;
-      }
-      delete params.modelProvider;
-      activeTurnCount += 1;
-    }
-    if (parsed.method === "thread/fork") {
-      params.cwd = authorized.projectPath;
-      delete params.modelProvider;
-      delete params.providerId;
-    }
-    if (parsed.method === "thread/resume") {
-      // Resuming a thread must stay inside the desktop allowlist and retain
-      // the provider selected when the thread was created.  The app-server
-      // accepts cwd/provider-shaped fields on resume, so do not trust values
-      // supplied by the phone here.
-      params.cwd = authorized.projectPath;
-      delete params.modelProvider;
-      delete params.providerId;
-    }
     let project;
     try {
       // The desktop allowlist may have changed after this thread was cached.
@@ -186,6 +161,34 @@ function createCompanionPolicy({
     } catch (error) {
       sendResponse(rpcError(parsed.id, error));
       return;
+    }
+    let params = { ...(parsed.params || {}) };
+    if (parsed.method === "turn/start") {
+      try {
+        // Use the freshly resolved path, not the path cached when thread/list
+        // authorized this thread. This also avoids incrementing the active
+        // turn counter when the project has since been removed.
+        params = enforceExecutionSettings(params, project.path);
+      } catch (error) {
+        sendResponse(rpcError(parsed.id, error));
+        return;
+      }
+      delete params.modelProvider;
+      activeTurnCount += 1;
+    }
+    if (parsed.method === "thread/fork") {
+      params.cwd = project.path;
+      delete params.modelProvider;
+      delete params.providerId;
+    }
+    if (parsed.method === "thread/resume") {
+      // Resuming a thread must stay inside the desktop allowlist and retain
+      // the provider selected when the thread was created.  The app-server
+      // accepts cwd/provider-shaped fields on resume, so do not trust values
+      // supplied by the phone here.
+      params.cwd = project.path;
+      delete params.modelProvider;
+      delete params.providerId;
     }
     pendingRequests.set(String(parsed.id), {
       method: parsed.method,
@@ -204,6 +207,15 @@ function createCompanionPolicy({
       sendResponse(rpcError(parsed.id, Object.assign(new Error("审批请求已失效或决策无效。"), {
         code: "approval_not_pending",
       })));
+      return;
+    }
+    const authorized = authorizedThreads.get(pending.threadId);
+    try {
+      if (!authorized) throw Object.assign(new Error("审批所属任务已不再允许。"), { code: "thread_not_allowed" });
+      projectStore.resolve(authorized.projectId);
+    } catch (error) {
+      pendingApprovals.delete(requestId);
+      sendResponse(rpcError(parsed.id, error));
       return;
     }
     pendingApprovals.delete(requestId);
@@ -338,6 +350,9 @@ function createCompanionPolicy({
       const threadId = readThreadId(parsed);
       if (!isAuthorizedThread(threadId)) return null;
       activeTurnCount = Math.max(0, activeTurnCount - 1);
+      for (const [requestId, approval] of pendingApprovals.entries()) {
+        if (approval.threadId === threadId) pendingApprovals.delete(requestId);
+      }
       return rawMessage;
     }
     const threadId = readThreadId(parsed);

@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -141,13 +142,13 @@ private fun MainShell(state: MainUiState, viewModel: MainViewModel, snackbar: Sn
     var tab by remember { mutableStateOf(Tab.HOME) }
     val selectedThread = state.selectedThreadId
     if (selectedThread != null) {
-        ThreadScreen(state, selectedThread, viewModel)
+        ThreadScreen(state, selectedThread, viewModel, snackbar)
         return
     }
     Scaffold(
         containerColor = Paper,
         snackbarHost = { SnackbarHost(snackbar) },
-        topBar = { TopAppBar(title = { Column { Text(tab.label, fontWeight = FontWeight.Bold); ConnectionLabel(state.connection) } }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Paper), actions = { if (state.busy) CircularProgressIndicator(Modifier.padding(end = 16.dp).size(18.dp), strokeWidth = 2.dp) }) },
+        topBar = { TopAppBar(title = { Column { Text(tab.label, fontWeight = FontWeight.Bold); ConnectionLabel(state.connection, state.rpcReady) } }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Paper), actions = { if (state.busy) CircularProgressIndicator(Modifier.padding(end = 16.dp).size(18.dp), strokeWidth = 2.dp) }) },
         bottomBar = { NavigationBar(Modifier.navigationBarsPadding(), containerColor = Panel) { Tab.entries.forEach { item -> NavigationBarItem(selected = tab == item, onClick = { tab = item }, icon = { Text(item.glyph, fontWeight = FontWeight.Bold) }, label = { Text(item.label) }) } } },
     ) { padding ->
         Box(Modifier.padding(padding).fillMaxSize()) {
@@ -162,12 +163,12 @@ private fun MainShell(state: MainUiState, viewModel: MainViewModel, snackbar: Sn
 }
 
 @Composable
-private fun ConnectionLabel(state: ConnectionState) {
+private fun ConnectionLabel(state: ConnectionState, rpcReady: Boolean = true) {
     Text(when (state) {
         ConnectionState.Disconnected -> "未连接"
         is ConnectionState.Connecting -> "正在连接"
         is ConnectionState.Handshaking -> "正在验证主机"
-        is ConnectionState.Ready -> "已安全连接 · ${state.hostName}"
+        is ConnectionState.Ready -> if (rpcReady) "已安全连接 · ${state.hostName}" else "正在初始化 Codex"
         is ConnectionState.Waiting -> "等待重连 · ${state.reason}"
     }, color = Muted, style = MaterialTheme.typography.labelSmall)
 }
@@ -196,16 +197,16 @@ private fun HomeScreen(state: MainUiState, viewModel: MainViewModel) {
 private fun StatusCard(state: MainUiState, refresh: () -> Unit) {
     Card(colors = CardDefaults.cardColors(containerColor = Ink), shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
         Row(Modifier.padding(17.dp), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) { Text(state.host?.displayName ?: "Windows", color = Color.White, fontWeight = FontWeight.Bold); ConnectionLabelOnDark(state.connection); Text("${state.projects.size} 个项目 · ${state.providers.size} 个 Provider", color = Color(0xFFB8C4BE), style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 5.dp)) }
+            Column(Modifier.weight(1f)) { Text(state.host?.displayName ?: "Windows", color = Color.White, fontWeight = FontWeight.Bold); ConnectionLabelOnDark(state.connection, state.rpcReady); Text("${state.projects.size} 个项目 · ${state.providers.size} 个 Provider", color = Color(0xFFB8C4BE), style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(top = 5.dp)) }
             OutlinedButton(onClick = refresh) { Text("刷新", color = Lime) }
         }
     }
 }
 
 @Composable
-private fun ConnectionLabelOnDark(state: ConnectionState) {
+private fun ConnectionLabelOnDark(state: ConnectionState, rpcReady: Boolean) {
     val label = when (state) {
-        is ConnectionState.Ready -> "E2EE 在线"
+        is ConnectionState.Ready -> if (rpcReady) "E2EE 在线" else "正在初始化 Codex"
         is ConnectionState.Waiting -> "重连中 · ${state.reason}"
         is ConnectionState.Handshaking -> "正在验证主机"
         is ConnectionState.Connecting -> "正在连接 · 第 ${state.attempt} 次"
@@ -213,7 +214,7 @@ private fun ConnectionLabelOnDark(state: ConnectionState) {
     }
     Text(
         label,
-        color = if (state is ConnectionState.Ready) Lime else Color(0xFFFFD675),
+        color = if (state is ConnectionState.Ready && rpcReady) Lime else Color(0xFFFFD675),
         maxLines = 2,
         overflow = TextOverflow.Ellipsis,
     )
@@ -246,7 +247,7 @@ private fun NewTaskScreen(state: MainUiState, viewModel: MainViewModel) {
             if (state.hostPermissions.allowNeverApproval) add("never" to "从不审批（电脑已允许）")
         }) { approval = it }
         OutlinedTextField(prompt, { prompt = it }, label = { Text("任务说明") }, minLines = 7, modifier = Modifier.fillMaxWidth())
-        Button(onClick = { viewModel.startTask(projectId, providerId, prompt, model.ifBlank { null }, effort, sandbox, approval) }, enabled = projectId.isNotBlank() && prompt.isNotBlank() && state.connection is ConnectionState.Ready && !state.busy, modifier = Modifier.fillMaxWidth()) { Text("启动任务") }
+        Button(onClick = { viewModel.startTask(projectId, providerId, prompt, model.ifBlank { null }, effort, sandbox, approval) }, enabled = projectId.isNotBlank() && prompt.isNotBlank() && state.connection is ConnectionState.Ready && state.rpcReady && !state.busy, modifier = Modifier.fillMaxWidth()) { Text("启动任务") }
         Text("danger-full-access 与 never 只能先在电脑端显式放开；手机无法提升权限上限。", color = Muted, style = MaterialTheme.typography.bodySmall)
     }
 }
@@ -312,7 +313,7 @@ private fun parseProviderHeaders(value: String): Map<String, String> = value.lin
 private fun SettingsScreen(state: MainUiState, viewModel: MainViewModel) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("连接与安全", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-        Card(colors = CardDefaults.cardColors(containerColor = Panel)) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) { Text(state.host?.displayName ?: "Windows", fontWeight = FontWeight.Bold); Text("主机身份 ${state.host?.macDeviceId?.take(12)}…", color = Muted, fontFamily = FontFamily.Monospace); ConnectionLabel(state.connection) } }
+        Card(colors = CardDefaults.cardColors(containerColor = Panel)) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) { Text(state.host?.displayName ?: "Windows", fontWeight = FontWeight.Bold); Text("主机身份 ${state.host?.macDeviceId?.take(12)}…", color = Muted, fontFamily = FontFamily.Monospace); ConnectionLabel(state.connection, state.rpcReady) } }
         OutlinedButton(onClick = viewModel::connect, modifier = Modifier.fillMaxWidth()) { Text("立即重连") }
         OutlinedButton(onClick = viewModel::disconnect, modifier = Modifier.fillMaxWidth()) { Text("暂时断开") }
         OutlinedButton(onClick = viewModel::unpair, modifier = Modifier.fillMaxWidth()) { Text("解除配对并清除本机缓存", color = Color(0xFFB3473D)) }
@@ -322,19 +323,32 @@ private fun SettingsScreen(state: MainUiState, viewModel: MainViewModel) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ThreadScreen(state: MainUiState, threadId: String, viewModel: MainViewModel) {
+private fun ThreadScreen(
+    state: MainUiState,
+    threadId: String,
+    viewModel: MainViewModel,
+    snackbar: SnackbarHostState,
+) {
     val thread = state.threads.firstOrNull { it.id == threadId }
     var steer by remember { mutableStateOf("") }
     var approval by remember { mutableStateOf<ApprovalEntity?>(null) }
     val timeline = state.timelines[threadId].orEmpty()
     val conversation = timeline.filter(::isConversationEntry)
+    val threadApprovals = state.approvals.filter { it.threadId == threadId }
+    val listState = rememberLazyListState()
+    LaunchedEffect(conversation.size, threadApprovals.size) {
+        if (conversation.isNotEmpty()) {
+            listState.animateScrollToItem(threadApprovals.size + conversation.lastIndex)
+        }
+    }
     Scaffold(
         containerColor = Paper,
+        snackbarHost = { SnackbarHost(snackbar) },
         topBar = { TopAppBar(title = { Column { Text(thread?.name ?: "任务", maxLines = 1, overflow = TextOverflow.Ellipsis); Text(threadId.take(12), color = Muted, style = MaterialTheme.typography.labelSmall) } }, navigationIcon = { TextButton(onClick = { viewModel.openThread(null) }) { Text("‹ 返回") } }, actions = { TextButton(onClick = { viewModel.interrupt(threadId) }) { Text("停止") } }) },
-        bottomBar = { Row(Modifier.navigationBarsPadding().background(Panel).padding(10.dp), verticalAlignment = Alignment.CenterVertically) { OutlinedTextField(steer, { steer = it }, placeholder = { Text("追加、steer 或排队指令") }, modifier = Modifier.weight(1f), maxLines = 3); Spacer(Modifier.width(8.dp)); Column(verticalArrangement = Arrangement.spacedBy(4.dp)) { Button(onClick = { viewModel.steer(threadId, steer); steer = "" }, enabled = steer.isNotBlank()) { Text("Steer") }; OutlinedButton(onClick = { viewModel.queue(threadId, steer); steer = "" }, enabled = steer.isNotBlank()) { Text("排队") } } } },
+        bottomBar = { Row(Modifier.navigationBarsPadding().background(Panel).padding(10.dp), verticalAlignment = Alignment.CenterVertically) { OutlinedTextField(steer, { steer = it }, placeholder = { Text("追加、steer 或排队指令") }, modifier = Modifier.weight(1f), maxLines = 3); Spacer(Modifier.width(8.dp)); Column(verticalArrangement = Arrangement.spacedBy(4.dp)) { Button(onClick = { val submitted = steer; viewModel.steer(threadId, submitted) { if (steer == submitted) steer = "" } }, enabled = steer.isNotBlank() && state.rpcReady && !state.busy) { Text("Steer") }; OutlinedButton(onClick = { val submitted = steer; viewModel.queue(threadId, submitted) { if (steer == submitted) steer = "" } }, enabled = steer.isNotBlank() && state.rpcReady && !state.busy) { Text("排队") } } } },
     ) { padding ->
-        LazyColumn(Modifier.padding(padding).fillMaxSize().padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            state.approvals.filter { it.threadId == threadId }.forEach { pending -> item(key = "approval-${pending.requestId}") { Card(Modifier.fillMaxWidth().clickable { approval = pending }, colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3C9))) { Column(Modifier.padding(14.dp)) { Text("等待你的审批", fontWeight = FontWeight.Bold); Text(pending.method, color = Muted); Text("点按查看详情", color = Color(0xFF705B16)) } } } }
+        LazyColumn(Modifier.padding(padding).fillMaxSize().padding(horizontal = 12.dp), state = listState, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            threadApprovals.forEach { pending -> item(key = "approval-${pending.requestId}") { Card(Modifier.fillMaxWidth().clickable { approval = pending }, colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3C9))) { Column(Modifier.padding(14.dp)) { Text("等待你的审批", fontWeight = FontWeight.Bold); Text(pending.method, color = Muted); Text("点按查看详情", color = Color(0xFF705B16)) } } } }
             if (conversation.isEmpty()) item { EmptyCard("Codex 正在处理；完成后这里只显示对话结果。") }
             // Include the event type in the key: Codex can emit a delta and a
             // completion for the same item within one millisecond. Using only
