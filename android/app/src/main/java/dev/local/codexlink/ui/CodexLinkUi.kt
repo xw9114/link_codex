@@ -336,7 +336,11 @@ private fun ThreadScreen(state: MainUiState, threadId: String, viewModel: MainVi
         LazyColumn(Modifier.padding(padding).fillMaxSize().padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             state.approvals.filter { it.threadId == threadId }.forEach { pending -> item(key = "approval-${pending.requestId}") { Card(Modifier.fillMaxWidth().clickable { approval = pending }, colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3C9))) { Column(Modifier.padding(14.dp)) { Text("等待你的审批", fontWeight = FontWeight.Bold); Text(pending.method, color = Muted); Text("点按查看详情", color = Color(0xFF705B16)) } } } }
             if (conversation.isEmpty()) item { EmptyCard("Codex 正在处理；完成后这里只显示对话结果。") }
-            items(conversation, key = { "${it.stableId}-${it.timestamp}" }) { entry -> ConversationBubble(entry) }
+            // Include the event type in the key: Codex can emit a delta and a
+            // completion for the same item within one millisecond. Using only
+            // itemId+timestamp would make Compose see duplicate LazyColumn keys
+            // and terminate the activity while the response is streaming.
+            items(conversation, key = { "${it.type}-${it.stableId}-${it.timestamp}" }) { entry -> ConversationBubble(entry) }
             item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { TextButton(onClick = { viewModel.fork(threadId) }) { Text("Fork") }; TextButton(onClick = { viewModel.archive(threadId) }) { Text("归档") } }; Spacer(Modifier.height(10.dp)) }
         }
     }
